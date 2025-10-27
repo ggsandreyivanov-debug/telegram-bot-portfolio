@@ -2,7 +2,10 @@ import os
 from telegram import Update
 from telegram.ext import ApplicationBuilder, MessageHandler, ContextTypes, CommandHandler, filters
 
-TOKEN = os.getenv("8298932729:AAF5hv6ZC_No6jYszDwUn7g5LqxPtndNdQ0")
+# 1. Не храним токен прямо в коде
+# 2. Берём его из переменной окружения BOT_TOKEN
+TOKEN = os.getenv("BOT_TOKEN")
+
 if TOKEN is None:
     raise RuntimeError("⚠ BOT_TOKEN is not set in environment!")
 
