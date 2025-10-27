@@ -3,6 +3,8 @@ from telegram import Update
 from telegram.ext import ApplicationBuilder, MessageHandler, ContextTypes, CommandHandler, filters
 
 TOKEN = os.getenv("8298932729:AAF5hv6ZC_No6jYszDwUn7g5LqxPtndNdQ0")
+if TOKEN is None:
+    raise RuntimeError("⚠ BOT_TOKEN is not set in environment!")
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("✅ Бот запущен! Напиши мне что-нибудь — я покажу твой chat_id.")
