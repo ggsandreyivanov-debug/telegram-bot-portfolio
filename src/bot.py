@@ -7,7 +7,7 @@ from datetime import time as dt_time
 
 from telegram import Update
 from telegram.ext import (
-    ApplicationBuilder,
+    Application,
     CommandHandler,
     MessageHandler,
     ContextTypes,
@@ -469,7 +469,8 @@ async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE):
     print("❌ Global error handler:", context.error, traceback.format_exc())
 
 def main():
-    app = ApplicationBuilder().token(TOKEN).build()
+    # Используем Application.builder() вместо ApplicationBuilder()
+    app = Application.builder().token(TOKEN).build()
 
     # Команды
     app.add_handler(CommandHandler("start", cmd_start))
@@ -485,29 +486,32 @@ def main():
     # Планировщик заданий
     job_queue = app.job_queue
     
-    # Проверка алертов каждые 10 минут
-    job_queue.run_repeating(check_price_alerts, interval=600, first=60)
-    
-    # Ежедневный отчёт в 11:00 по Риге (Europe/Riga = UTC+2/UTC+3)
-    job_queue.run_daily(
-        daily_report,
-        time=dt_time(hour=11, minute=0),
-        days=(0, 1, 2, 3, 4, 5, 6),  # каждый день
-        name='daily_report'
-    )
-    
-    # Еженедельный отчёт в воскресенье 19:00 по Риге
-    job_queue.run_daily(
-        weekly_report,
-        time=dt_time(hour=19, minute=0),
-        days=(6,),  # воскресенье = 6
-        name='weekly_report'
-    )
-
-    print("🚀 Bot is running with monitoring enabled.")
-    print("📊 Alert checks: every 10 minutes")
-    print("🌅 Daily report: 11:00 Riga time")
-    print("📆 Weekly report: Sunday 19:00 Riga time")
+    if job_queue and CHAT_ID:
+        # Проверка алертов каждые 10 минут
+        job_queue.run_repeating(check_price_alerts, interval=600, first=60)
+        
+        # Ежедневный отчёт в 11:00 по Риге (Europe/Riga = UTC+2/UTC+3)
+        job_queue.run_daily(
+            daily_report,
+            time=dt_time(hour=11, minute=0),
+            days=(0, 1, 2, 3, 4, 5, 6),  # каждый день
+            name='daily_report'
+        )
+        
+        # Еженедельный отчёт в воскресенье 19:00 по Риге
+        job_queue.run_daily(
+            weekly_report,
+            time=dt_time(hour=19, minute=0),
+            days=(6,),  # воскресенье = 6
+            name='weekly_report'
+        )
+        
+        print("🚀 Bot is running with monitoring enabled.")
+        print("📊 Alert checks: every 10 minutes")
+        print("🌅 Daily report: 11:00 Riga time")
+        print("📆 Weekly report: Sunday 19:00 Riga time")
+    else:
+        print("🚀 Bot is running (monitoring disabled - CHAT_ID not set).")
     
     app.run_polling()
 
