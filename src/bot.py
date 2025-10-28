@@ -1,9 +1,11 @@
 import os
 import math
+import asyncio
 import traceback
 import aiohttp
 from typing import Dict, Any, Optional, Tuple, List
 from datetime import time as dt_time
+from pytz import timezone
 
 from telegram import Update
 from telegram.ext import (
@@ -16,29 +18,27 @@ from telegram.ext import (
 
 # === ENV ===
 TOKEN = os.getenv("BOT_TOKEN")
-CHAT_ID = os.getenv("CHAT_ID")  # ваш chat_id для автоматических уведомлений
+CHAT_ID = os.getenv("CHAT_ID")  # ваш chat_id для уведомлений
 if not TOKEN:
     raise RuntimeError("⚠ BOT_TOKEN is not set in environment!")
 if not CHAT_ID:
-    print("⚠ CHAT_ID не установлен - автоматические уведомления будут отключены")
+    print("⚠ CHAT_ID не установлен — уведомления будут отключены")
 
 # === CONFIG ===
 HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
     "Accept": "application/json",
-    "Accept-Language": "en-US,en;q=0.9",
 }
-TIMEOUT = aiohttp.ClientTimeout(total=15)
+TIMEOUT = aiohttp.ClientTimeout(connect=10, total=15)
+RIGA_TZ = timezone("Europe/Riga")
 
-# Тикеры на Yahoo Finance
 YF_TICKERS = {
     "VWCE": "VWCE.DE",
     "GOLD": "4GLD.DE",
-    "XETRA_GOLD": "EWG2.DE",  # X IE Physical Gold ETC
+    "XETRA_GOLD": "EWG2.DE",
     "SP500": "SPY",
 }
 
-# Крипта: CoinGecko id + Binance-символы (для фолбэка)
 COINS = {
     "BTC": ("bitcoin", "BTCUSDT"),
     "ETH": ("ethereum", "ETHUSDT"),
@@ -48,103 +48,41 @@ COINS = {
     "LINK": ("chainlink", "LINKUSDT"),
 }
 
-# Пороги для алертов (можно менять через /setalert)
-THRESHOLDS = {
-    "stocks": 1.0,   # ±1% для акций/ETF
-    "crypto": 4.0,   # ±4% для криптовалют
-}
-
-# Хранилище последних цен для алертов
+THRESHOLDS = {"stocks": 1.0, "crypto": 4.0}
 last_prices: Dict[str, float] = {}
 
-# ----------------- HTTP helpers -----------------
-async def get_json(session: aiohttp.ClientSession, url: str, params=None) -> Optional[Dict[str, Any]]:
+# === HTTP UTILS ===
+async def get_json(session: aiohttp.ClientSession, url: str, params=None):
     try:
         async with session.get(url, params=params, headers=HEADERS, timeout=TIMEOUT) as r:
-            print(f"🔍 Request: {url} | Status: {r.status}")
             if r.status != 200:
-                text = await r.text()
-                print(f"⚠ {url} -> HTTP {r.status}, Response: {text[:200]}")
+                print(f"⚠ {url} -> HTTP {r.status}")
                 return None
-            data = await r.json()
-            print(f"✅ Response received, data keys: {list(data.keys()) if isinstance(data, dict) else 'not a dict'}")
-            return data
+            return await r.json()
     except Exception as e:
-        print(f"❌ get_json({url}) error: {e}")
-        traceback.print_exc()
+        print(f"❌ get_json({url}) error:", e)
         return None
 
-# ----------------- PRICES: Yahoo Finance -----------------
-async def get_yahoo_prices(session: aiohttp.ClientSession) -> Dict[str, Tuple[Optional[float], Optional[str]]]:
-    """
-    Возвращает { 'VWCE': (price, currency), 'GOLD': (price, currency), 'SP500': (price, currency) }
-    Используем query2 + запасной метод через финансовые API
-    """
-    out: Dict[str, Tuple[Optional[float], Optional[str]]] = {k: (None, None) for k in YF_TICKERS}
-    
-    # Метод 1: Yahoo Finance query2
+# === DATA SOURCES ===
+async def get_yahoo_prices(session: aiohttp.ClientSession):
+    out = {}
     for k, sym in YF_TICKERS.items():
         try:
-            url = f"https://query2.finance.yahoo.com/v8/finance/chart/{sym}"
-            params = {"interval": "1d", "range": "1d"}
-            print(f"📊 Fetching {k} ({sym})...")
-            data = await get_json(session, url, params)
-            
-            if data:
-                result = data.get("chart", {}).get("result", [{}])[0]
-                meta = result.get("meta", {})
-                price = meta.get("regularMarketPrice")
-                cur = meta.get("currency", "USD")
-                if price:
-                    out[k] = (float(price), cur)
-                    print(f"  ✅ {k}: {price} {cur}")
-                else:
-                    print(f"  ⚠️ {k}: no price in response")
-            else:
-                print(f"  ❌ {k}: no data returned")
-            
-            await asyncio.sleep(0.3)  # Задержка между запросами
-            
+            data = await get_json(session, f"https://query2.finance.yahoo.com/v8/finance/chart/{sym}", {"interval": "1d", "range": "1d"})
+            if not data or not data.get("chart", {}).get("result"):
+                continue
+            meta = data["chart"]["result"][0].get("meta", {})
+            price = meta.get("regularMarketPrice")
+            cur = meta.get("currency", "USD")
+            if price:
+                out[k] = (float(price), cur)
+            await asyncio.sleep(0.2)
         except Exception as e:
-            print(f"  ❌ {k} error: {e}")
-            traceback.print_exc()
-    
+            print(f"⚠ {k}:", e)
     return out
 
-# ----------------- PRICES: CoinGecko + fallback Binance -----------------
-async def get_coingecko(session: aiohttp.ClientSession) -> Dict[str, Dict[str, Optional[float]]]:
-    ids = ",".join(v[0] for v in COINS.values())
-    url = "https://api.coingecko.com/api/v3/simple/price"
-    params = {"ids": ids, "vs_currencies": "usd", "include_24hr_change": "true"}
-    print(f"🪙 Fetching CoinGecko: {ids}")
-    
-    # Добавляем задержку между запросами для избежания rate limit
-    await asyncio.sleep(1)
-    
-    data = await get_json(session, url, params)
-    out: Dict[str, Dict[str, Optional[float]]] = {}
-    if not data:
-        print("❌ CoinGecko returned no data (rate limited or blocked)")
-        return out
-
-    # map id->sym
-    id_to_sym = {v[0]: k for k, v in COINS.items()}
-    for cg_id, payload in data.items():
-        sym = id_to_sym.get(cg_id)
-        if not sym:
-            continue
-        price = payload.get("usd")
-        chg = payload.get("usd_24h_change")
-        chg_str = f"{chg:+.2f}%" if chg else "N/A"
-        print(f"  • {sym}: ${price} ({chg_str})")
-        out[sym] = {"usd": float(price) if price is not None else None,
-                    "change_24h": float(chg) if chg is not None else None}
-    return out
-
-async def get_coinpaprika_price(session: aiohttp.ClientSession, coin_id: str) -> Optional[Dict[str, float]]:
-    """Альтернатива CoinGecko - CoinPaprika (без rate limits на free tier)"""
-    # Маппинг на CoinPaprika IDs
-    paprika_map = {
+async def get_coinpaprika_price(session: aiohttp.ClientSession, coin_id: str):
+    mapping = {
         "bitcoin": "btc-bitcoin",
         "ethereum": "eth-ethereum",
         "solana": "sol-solana",
@@ -152,470 +90,114 @@ async def get_coinpaprika_price(session: aiohttp.ClientSession, coin_id: str) ->
         "dogecoin": "doge-dogecoin",
         "chainlink": "link-chainlink",
     }
-    
-    paprika_id = paprika_map.get(coin_id)
+    paprika_id = mapping.get(coin_id)
     if not paprika_id:
         return None
-    
-    url = f"https://api.coinpaprika.com/v1/tickers/{paprika_id}"
-    try:
-        data = await get_json(session, url, None)
-        if data:
-            quotes = data.get("quotes", {}).get("USD", {})
-            price = quotes.get("price")
-            change_24h = quotes.get("percent_change_24h")
-            if price:
-                return {
-                    "usd": float(price),
-                    "change_24h": float(change_24h) if change_24h else None
-                }
-    except Exception as e:
-        print(f"❌ CoinPaprika {coin_id} error: {e}")
+    data = await get_json(session, f"https://api.coinpaprika.com/v1/tickers/{paprika_id}")
+    if data:
+        quotes = data.get("quotes", {}).get("USD", {})
+        return {"usd": quotes.get("price"), "change_24h": quotes.get("percent_change_24h")}
     return None
 
-async def get_binance_price(session: aiohttp.ClientSession, symbol: str) -> Optional[float]:
-    url = "https://api.binance.com/api/v3/ticker/price"
-    data = await get_json(session, url, {"symbol": symbol})
-    try:
-        if data and "price" in data:
-            return float(data["price"])
-    except Exception as e:
-        print(f"⚠ parse_binance {symbol} error:", e)
-    return None
-
-async def get_crypto_prices(session: aiohttp.ClientSession) -> Dict[str, Dict[str, Optional[float]]]:
-    """
-    Используем только CoinPaprika (более надёжный, без rate limits)
-    """
-    print("🪙 Fetching crypto prices from CoinPaprika...")
+async def get_crypto_prices(session: aiohttp.ClientSession):
     base = {}
-    
     for sym, (coin_id, _) in COINS.items():
-        try:
-            data = await get_coinpaprika_price(session, coin_id)
-            if data:
-                base[sym] = data
-                print(f"  ✅ {sym}: ${data['usd']}")
-            else:
-                print(f"  ❌ {sym}: failed to fetch")
-            await asyncio.sleep(0.2)  # Небольшая задержка
-        except Exception as e:
-            print(f"  ❌ {sym} error: {e}")
-    
+        data = await get_coinpaprika_price(session, coin_id)
+        if data:
+            base[sym] = data
+        await asyncio.sleep(0.2)
     return base
 
-# ----------------- MONITORING LOGIC -----------------
+# === MONITORING ===
 async def check_price_alerts(context: ContextTypes.DEFAULT_TYPE):
-    """Проверка цен каждые 10 минут и отправка алертов"""
     if not CHAT_ID:
         return
-    
     try:
         async with aiohttp.ClientSession() as session:
             yf = await get_yahoo_prices(session)
             crypto = await get_crypto_prices(session)
-        
+
         alerts = []
-        
-        # Проверяем акции/ETF
-        for key, (price, currency) in yf.items():
+        for key, (price, _) in yf.items():
             if price is None:
                 continue
-            
             cache_key = f"stock_{key}"
             if cache_key in last_prices:
-                old_price = last_prices[cache_key]
-                change_pct = ((price - old_price) / old_price) * 100
-                
-                if abs(change_pct) >= THRESHOLDS["stocks"]:
-                    emoji = "📈" if change_pct > 0 else "📉"
-                    alerts.append(
-                        f"{emoji} <b>{key}</b>: {change_pct:+.2f}%\n"
-                        f"Цена: {price:.2f} {currency or ''}"
-                    )
-            
+                diff = ((price - last_prices[cache_key]) / last_prices[cache_key]) * 100
+                if abs(diff) >= THRESHOLDS["stocks"]:
+                    emoji = "📈" if diff > 0 else "📉"
+                    alerts.append(f"{emoji} <b>{key}</b>: {diff:+.2f}% → {price:.2f}")
             last_prices[cache_key] = price
-        
-        # Проверяем криптовалюты
+
         for sym, data in crypto.items():
             price = data.get("usd")
             if price is None:
                 continue
-            
             cache_key = f"crypto_{sym}"
             if cache_key in last_prices:
-                old_price = last_prices[cache_key]
-                change_pct = ((price - old_price) / old_price) * 100
-                
-                if abs(change_pct) >= THRESHOLDS["crypto"]:
-                    emoji = "🚀" if change_pct > 0 else "⚠️"
-                    alerts.append(
-                        f"{emoji} <b>{sym}</b>: {change_pct:+.2f}%\n"
-                        f"Цена: ${price:,.2f}"
-                    )
-            
+                diff = ((price - last_prices[cache_key]) / last_prices[cache_key]) * 100
+                if abs(diff) >= THRESHOLDS["crypto"]:
+                    emoji = "🚀" if diff > 0 else "⚠️"
+                    alerts.append(f"{emoji} <b>{sym}</b>: {diff:+.2f}% → ${price:,.2f}")
             last_prices[cache_key] = price
-        
-        # Отправляем алерты
+
         if alerts:
-            message = "🔔 <b>Ценовые алерты!</b>\n\n" + "\n\n".join(alerts)
-            await context.bot.send_message(
-                chat_id=CHAT_ID,
-                text=message,
-                parse_mode='HTML'
-            )
-    
-    except Exception as e:
-        print(f"❌ check_price_alerts error: {e}", traceback.format_exc())
+            await context.bot.send_message(chat_id=CHAT_ID, text="🔔 <b>Ценовые алерты:</b>\n\n" + "\n\n".join(alerts), parse_mode='HTML')
 
+    except Exception as e:
+        print("❌ check_price_alerts:", e)
+
+# === DAILY & WEEKLY ===
 async def daily_report(context: ContextTypes.DEFAULT_TYPE):
-    """Ежедневный отчёт в 11:00 по Риге"""
     if not CHAT_ID:
         return
-    
-    try:
-        async with aiohttp.ClientSession() as session:
-            yf = await get_yahoo_prices(session)
-            crypto = await get_crypto_prices(session)
-        
-        from datetime import datetime
-        now = datetime.now().strftime("%d.%m.%Y")
-        
-        lines = [f"🌅 <b>Утренние цены ({now})</b>\n"]
-        
-        # Акции/ETF
-        lines.append("<b>📊 Фондовый рынок:</b>")
-        for key in ["VWCE", "GOLD", "XETRA_GOLD", "SP500"]:
-            price, currency = yf.get(key, (None, None))
-            if price:
-                name_map = {
-                    "VWCE": "VWCE",
-                    "GOLD": "4GLD (Gold ETC)",
-                    "XETRA_GOLD": "X IE Physical Gold ETC",
-                    "SP500": "S&P 500 (SPY)"
-                }
-                lines.append(f"• {name_map[key]}: {price:.2f} {currency or ''}")
-            else:
-                lines.append(f"• {key}: н/д")
-        
-        # Криптовалюты
-        lines.append("\n<b>₿ Криптовалюты:</b>")
-        for sym in ["BTC", "ETH", "SOL", "AVAX", "DOGE", "LINK"]:
-            data = crypto.get(sym, {})
-            price = data.get("usd")
-            chg = data.get("change_24h")
-            if price:
-                if isinstance(chg, (int, float)) and not math.isnan(chg):
-                    lines.append(f"• {sym}: ${price:,.2f} ({chg:+.2f}%)")
-                else:
-                    lines.append(f"• {sym}: ${price:,.2f}")
-            else:
-                lines.append(f"• {sym}: н/д")
-        
-        await context.bot.send_message(
-            chat_id=CHAT_ID,
-            text="\n".join(lines),
-            parse_mode='HTML'
-        )
-    
-    except Exception as e:
-        print(f"❌ daily_report error: {e}", traceback.format_exc())
-
-async def weekly_report(context: ContextTypes.DEFAULT_TYPE):
-    """Еженедельный отчёт в воскресенье 19:00"""
-    if not CHAT_ID:
-        return
-    
-    try:
-        async with aiohttp.ClientSession() as session:
-            yf = await get_yahoo_prices(session)
-            crypto = await get_crypto_prices(session)
-        
-        lines = ["📆 <b>Еженедельный отчёт</b>\n"]
-        
-        # Акции/ETF
-        lines.append("<b>📊 Фондовый рынок:</b>")
-        for key in ["VWCE", "GOLD", "XETRA_GOLD", "SP500"]:
-            price, currency = yf.get(key, (None, None))
-            if price:
-                name_map = {
-                    "VWCE": "VWCE",
-                    "GOLD": "4GLD (Gold ETC)",
-                    "XETRA_GOLD": "X IE Physical Gold ETC",
-                    "SP500": "S&P 500 (SPY)"
-                }
-                lines.append(f"• {name_map[key]}: {price:.2f} {currency or ''}")
-        
-        # Криптовалюты
-        lines.append("\n<b>₿ Криптовалюты:</b>")
-        for sym in ["BTC", "ETH", "SOL", "AVAX", "DOGE", "LINK"]:
-            data = crypto.get(sym, {})
-            price = data.get("usd")
-            chg = data.get("change_24h")
-            if price:
-                if isinstance(chg, (int, float)) and not math.isnan(chg):
-                    lines.append(f"• {sym}: ${price:,.2f} ({chg:+.2f}%)")
-                else:
-                    lines.append(f"• {sym}: ${price:,.2f}")
-        
-        lines.append("\n<i>События недели отслеживаются вручную</i>")
-        
-        await context.bot.send_message(
-            chat_id=CHAT_ID,
-            text="\n".join(lines),
-            parse_mode='HTML'
-        )
-    
-    except Exception as e:
-        print(f"❌ weekly_report error: {e}", traceback.format_exc())
-
-# ----------------- BOT handlers -----------------
-async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
-        "👋 <b>Привет! Я бот для мониторинга портфеля</b>\n\n"
-        "<b>Доступные команды:</b>\n"
-        "/portfolio - показать текущие цены портфеля\n"
-        "/pingprices - показать все цены (включая SP500)\n"
-        "/alerts - настройки алертов\n"
-        "/setalert - изменить пороги уведомлений\n"
-        "/status - проверка работы бота\n"
-        "/help - подробная помощь\n\n"
-        "🔔 <b>Автоматические уведомления:</b>\n"
-        "• Алерты каждые 10 минут\n"
-        "• Утренний отчёт в 11:00 (Рига)\n"
-        "• Недельный отчёт в Вс 19:00 (Рига)",
-        parse_mode='HTML'
-    )
-
-async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    async with aiohttp.ClientSession() as session:
+        yf = await get_yahoo_prices(session)
+        crypto = await get_crypto_prices(session)
     from datetime import datetime
-    now = datetime.now().strftime("%H:%M:%S %d.%m.%Y")
-    monitored = len(YF_TICKERS) + len(COINS)
-    await update.message.reply_text(
-        f"✅ <b>Бот работает!</b>\n\n"
-        f"🕐 Время: {now}\n"
-        f"📊 Отслеживается активов: {monitored}\n"
-        f"💾 В кэше цен: {len(last_prices)}",
-        parse_mode='HTML'
-    )
+    now = datetime.now(RIGA_TZ).strftime("%d.%m.%Y")
+    msg = [f"🌅 <b>Утренние цены ({now})</b>\n"]
+    msg.append("<b>📊 Фондовый рынок:</b>")
+    for k in ["VWCE", "GOLD", "XETRA_GOLD", "SP500"]:
+        price, cur = yf.get(k, (None, None))
+        msg.append(f"• {k}: {price:.2f} {cur}" if price else f"• {k}: н/д")
+    msg.append("\n<b>₿ Криптовалюты:</b>")
+    for sym, d in crypto.items():
+        p, ch = d.get("usd"), d.get("change_24h")
+        msg.append(f"• {sym}: ${p:,.2f} ({ch:+.2f}%)" if p and ch else f"• {sym}: н/д")
+    await context.bot.send_message(chat_id=CHAT_ID, text="\n".join(msg), parse_mode='HTML')
+
+# === COMMANDS ===
+async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("👋 Бот активен! Используй /portfolio или /pingprices.", parse_mode='HTML')
 
 async def cmd_portfolio(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Показать только портфельные активы (без SP500)"""
-    print(f"📱 /portfolio command received from user {update.effective_user.id}")
-    try:
-        await update.message.reply_text("🔄 Получаю цены портфеля...")
-        print("📡 Starting data fetch...")
-        
-        async with aiohttp.ClientSession() as session:
-            print("🔗 Session created, fetching Yahoo...")
-            yf = await get_yahoo_prices(session)
-            print(f"✅ Yahoo done: {yf}")
-            
-            print("🔗 Fetching crypto...")
-            crypto = await get_crypto_prices(session)
-            print(f"✅ Crypto done: {crypto}")
+    await update.message.reply_text("🔄 Получаю цены...")
+    async with aiohttp.ClientSession() as session:
+        yf = await get_yahoo_prices(session)
+        crypto = await get_crypto_prices(session)
+    lines = ["💼 <b>Портфель:</b>"]
+    for key in ["VWCE", "GOLD", "XETRA_GOLD"]:
+        p, c = yf.get(key, (None, None))
+        lines.append(f"• {key}: {p:.2f} {c}" if p else f"• {key}: н/д")
+    for sym, d in crypto.items():
+        p, ch = d.get("usd"), d.get("change_24h")
+        if p:
+            emoji = "🟢" if ch and ch > 0 else "🔴"
+            lines.append(f"{emoji} {sym}: ${p:,.2f} ({ch:+.2f}%)" if ch else f"• {sym}: ${p:,.2f}")
+    await update.message.reply_text("\n".join(lines), parse_mode='HTML')
 
-        lines = ["💼 <b>Портфель:</b>\n"]
-        
-        # Только VWCE и GOLD
-        lines.append("<b>📊 ETF:</b>")
-        for key in ["VWCE", "GOLD", "XETRA_GOLD"]:
-            price, currency = yf.get(key, (None, None))
-            if price:
-                name_map = {
-                    "VWCE": "VWCE",
-                    "GOLD": "4GLD (Gold ETC)",
-                    "XETRA_GOLD": "X IE Physical Gold ETC"
-                }
-                name = name_map[key]
-                lines.append(f"• {name}: {price:.2f} {currency or ''}")
-            else:
-                lines.append(f"• {key}: н/д")
-        
-        # Криптовалюты
-        lines.append("\n<b>₿ Криптовалюты:</b>")
-        for sym in ["BTC", "ETH", "SOL", "AVAX", "DOGE", "LINK"]:
-            data = crypto.get(sym, {})
-            price = data.get("usd")
-            chg = data.get("change_24h")
-            if price:
-                if isinstance(chg, (int, float)) and not math.isnan(chg):
-                    emoji = "🟢" if chg >= 0 else "🔴"
-                    lines.append(f"{emoji} {sym}: ${price:,.2f} ({chg:+.2f}%)")
-                else:
-                    lines.append(f"• {sym}: ${price:,.2f}")
-            else:
-                lines.append(f"• {sym}: н/д")
-
-        await update.message.reply_text("\n".join(lines), parse_mode='HTML')
-        print("✅ Portfolio sent successfully")
-    except Exception as e:
-        print("❌ /portfolio error:", e)
-        traceback.print_exc()
-        await update.message.reply_text(f"⚠ Ошибка: {str(e)}\nПопробуй ещё раз.")
-
-async def cmd_pingprices(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Показать все цены включая SP500"""
-    print(f"📱 /pingprices command received from user {update.effective_user.id}")
-    try:
-        print("📡 Starting data fetch...")
-        async with aiohttp.ClientSession() as session:
-            yf = await get_yahoo_prices(session)
-            print(f"✅ Yahoo done: {yf}")
-            crypto = await get_crypto_prices(session)
-            print(f"✅ Crypto done: {crypto}")
-
-        lines = ["💹 <b>Все цены:</b>\n"]
-        
-        lines.append("<b>📊 Фондовый рынок:</b>")
-        for key in ["SP500", "VWCE", "GOLD", "XETRA_GOLD"]:
-            price, currency = yf.get(key, (None, None))
-            if price:
-                name_map = {
-                    "SP500": "S&P 500 (SPY)",
-                    "VWCE": "VWCE",
-                    "GOLD": "4GLD (Gold ETC)",
-                    "XETRA_GOLD": "X IE Physical Gold ETC"
-                }
-                name = name_map[key]
-                lines.append(f"• {name}: {price:.2f} {currency or ''}")
-            else:
-                lines.append(f"• {key}: н/д")
-
-        lines.append("\n<b>₿ Криптовалюты:</b>")
-        for sym in ["BTC", "ETH", "SOL", "AVAX", "DOGE", "LINK"]:
-            data = crypto.get(sym, {})
-            price = data.get("usd")
-            chg = data.get("change_24h")
-            if price:
-                if isinstance(chg, (int, float)) and not math.isnan(chg):
-                    lines.append(f"• {sym}: ${price:,.2f} ({chg:+.2f}%)")
-                else:
-                    lines.append(f"• {sym}: ${price:,.2f}")
-            else:
-                lines.append(f"• {sym}: н/д")
-
-        await update.message.reply_text("\n".join(lines), parse_mode='HTML')
-    except Exception as e:
-        print("❌ /pingprices error:", e, traceback.format_exc())
-        await update.message.reply_text("⚠ Не удалось получить данные. Попробуй ещё раз.")
-
-async def cmd_alerts(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Показать настройки алертов"""
-    message = (
-        "⚙️ <b>Настройки алертов:</b>\n\n"
-        f"<b>Фондовый рынок:</b> ±{THRESHOLDS['stocks']}%\n"
-        f"<b>Криптовалюты:</b> ±{THRESHOLDS['crypto']}%\n\n"
-        "<b>📅 Расписание:</b>\n"
-        "• Проверка цен: каждые 10 минут\n"
-        "• Утренний отчёт: 11:00 (Рига)\n"
-        "• Недельный отчёт: Вс 19:00 (Рига)\n\n"
-        f"💾 В кэше отслеживается: {len(last_prices)} цен"
-    )
-    await update.message.reply_text(message, parse_mode='HTML')
-
-async def cmd_setalert(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Изменить пороги алертов"""
-    if not context.args or len(context.args) != 2:
-        await update.message.reply_text(
-            "Использование: <code>/setalert [stocks|crypto] [процент]</code>\n\n"
-            "Примеры:\n"
-            "<code>/setalert stocks 2</code> — алерты для акций при ±2%\n"
-            "<code>/setalert crypto 5</code> — алерты для крипты при ±5%",
-            parse_mode='HTML'
-        )
-        return
-    
-    asset_type = context.args[0].lower()
-    try:
-        threshold = float(context.args[1])
-        if threshold <= 0:
-            raise ValueError()
-    except ValueError:
-        await update.message.reply_text("❌ Процент должен быть положительным числом")
-        return
-    
-    if asset_type not in ["stocks", "crypto"]:
-        await update.message.reply_text("❌ Тип должен быть 'stocks' или 'crypto'")
-        return
-    
-    THRESHOLDS[asset_type] = threshold
-    name = "акций/ETF" if asset_type == "stocks" else "криптовалют"
-    await update.message.reply_text(
-        f"✅ Порог алертов для {name} установлен: ±{threshold}%",
-        parse_mode='HTML'
-    )
-
-async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Подробная помощь"""
-    message = (
-        "📖 <b>Помощь по командам:</b>\n\n"
-        "<b>/portfolio</b> — показать портфель (VWCE, Gold, крипта)\n"
-        "<b>/pingprices</b> — показать все цены (+ SP500)\n"
-        "<b>/alerts</b> — текущие настройки уведомлений\n"
-        "<b>/setalert</b> — изменить пороги алертов\n"
-        "<b>/status</b> — проверка работы бота\n"
-        "<b>/help</b> — это сообщение\n\n"
-        "<b>🔔 Автоматика:</b>\n"
-        "Бот проверяет цены каждые 10 минут и отправляет алерты, "
-        "если цена изменилась больше установленного порога.\n\n"
-        "Ежедневно в 11:00 по Риге приходит утренний отчёт, "
-        "а по воскресеньям в 19:00 — недельный отчёт."
-    )
-    await update.message.reply_text(message, parse_mode='HTML')
-
-async def echo(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("Я тебя слышу 👂")
-
-async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE):
-    print("❌ Global error handler:", context.error, traceback.format_exc())
-
+# === MAIN ===
 def main():
-    # Используем Application.builder() вместо ApplicationBuilder()
     app = Application.builder().token(TOKEN).build()
-
-    # Команды
     app.add_handler(CommandHandler("start", cmd_start))
-    app.add_handler(CommandHandler("status", cmd_status))
     app.add_handler(CommandHandler("portfolio", cmd_portfolio))
-    app.add_handler(CommandHandler("pingprices", cmd_pingprices))
-    app.add_handler(CommandHandler("alerts", cmd_alerts))
-    app.add_handler(CommandHandler("setalert", cmd_setalert))
-    app.add_handler(CommandHandler("help", cmd_help))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, echo))
-    app.add_error_handler(on_error)
-
-    # Планировщик заданий
     job_queue = app.job_queue
-    
-    if job_queue and CHAT_ID:
-        # Проверка алертов каждые 10 минут
-        job_queue.run_repeating(check_price_alerts, interval=600, first=60)
-        
-        # Ежедневный отчёт в 11:00 по Риге (Europe/Riga = UTC+2/UTC+3)
-        job_queue.run_daily(
-            daily_report,
-            time=dt_time(hour=11, minute=0),
-            days=(0, 1, 2, 3, 4, 5, 6),  # каждый день
-            name='daily_report'
-        )
-        
-        # Еженедельный отчёт в воскресенье 19:00 по Риге
-        job_queue.run_daily(
-            weekly_report,
-            time=dt_time(hour=19, minute=0),
-            days=(6,),  # воскресенье = 6
-            name='weekly_report'
-        )
-        
-        print("🚀 Bot is running with monitoring enabled.")
-        print("📊 Alert checks: every 10 minutes")
-        print("🌅 Daily report: 11:00 Riga time")
-        print("📆 Weekly report: Sunday 19:00 Riga time")
-    else:
-        print("🚀 Bot is running (monitoring disabled - CHAT_ID not set).")
-    
-    app.run_polling()
+    if CHAT_ID:
+        job_queue.run_repeating(check_price_alerts, interval=600, first=30)
+        job_queue.run_daily(daily_report, time=dt_time(hour=11, tzinfo=RIGA_TZ))
+        print("✅ Scheduler active (Riga time).")
+    app.run_polling(stop_signals=None)
 
 if __name__ == "__main__":
     main()
