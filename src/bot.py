@@ -23,8 +23,12 @@ if not CHAT_ID:
     print("⚠ CHAT_ID не установлен - автоматические уведомления будут отключены")
 
 # === CONFIG ===
-HEADERS = {"User-Agent": "Mozilla/5.0 (compatible; AndreyBot/1.0; +https://t.me/)"}
-TIMEOUT = aiohttp.ClientTimeout(total=10)
+HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+    "Accept": "application/json",
+    "Accept-Language": "en-US,en;q=0.9",
+}
+TIMEOUT = aiohttp.ClientTimeout(total=15)
 
 # Тикеры на Yahoo Finance
 YF_TICKERS = {
@@ -73,33 +77,60 @@ async def get_json(session: aiohttp.ClientSession, url: str, params=None) -> Opt
 async def get_yahoo_prices(session: aiohttp.ClientSession) -> Dict[str, Tuple[Optional[float], Optional[str]]]:
     """
     Возвращает { 'VWCE': (price, currency), 'GOLD': (price, currency), 'SP500': (price, currency) }
+    Используем query2 вместо query1 + лучшие заголовки
     """
     symbols = ",".join(YF_TICKERS.values())
-    url = "https://query1.finance.yahoo.com/v7/finance/quote"
-    print(f"📊 Fetching Yahoo Finance: {symbols}")
-    data = await get_json(session, url, {"symbols": symbols})
+    # Попробуем несколько эндпоинтов Yahoo
+    urls = [
+        f"https://query2.finance.yahoo.com/v7/finance/quote?symbols={symbols}",
+        f"https://query1.finance.yahoo.com/v8/finance/chart/{list(YF_TICKERS.values())[0]}?interval=1d&range=1d",
+    ]
+    
     out: Dict[str, Tuple[Optional[float], Optional[str]]] = {k: (None, None) for k in YF_TICKERS}
-
-    if not data:
-        print("❌ Yahoo Finance returned no data")
-        return out
-
-    try:
-        res = (data or {}).get("quoteResponse", {}).get("result", [])
-        print(f"📈 Yahoo results count: {len(res)}")
-        by_symbol = {it.get("symbol"): it for it in res}
-        for k, sym in YF_TICKERS.items():
-            item = by_symbol.get(sym)
-            if item:
-                price = item.get("regularMarketPrice")
-                cur = item.get("currency")
-                print(f"  • {k} ({sym}): {price} {cur}")
-                out[k] = (float(price) if price is not None else None, cur)
-            else:
-                print(f"  • {k} ({sym}): not found in response")
-    except Exception as e:
-        print("❌ parse_yahoo error:", e)
-        traceback.print_exc()
+    
+    # Пробуем первый метод
+    print(f"📊 Fetching Yahoo Finance (query2): {symbols}")
+    data = await get_json(session, urls[0], None)
+    
+    if data:
+        try:
+            res = data.get("quoteResponse", {}).get("result", [])
+            print(f"📈 Yahoo results count: {len(res)}")
+            by_symbol = {it.get("symbol"): it for it in res}
+            for k, sym in YF_TICKERS.items():
+                item = by_symbol.get(sym)
+                if item:
+                    price = item.get("regularMarketPrice")
+                    cur = item.get("currency")
+                    print(f"  • {k} ({sym}): {price} {cur}")
+                    out[k] = (float(price) if price is not None else None, cur)
+                else:
+                    print(f"  • {k} ({sym}): not found in response")
+            
+            # Если получили хоть что-то, возвращаем
+            if any(p[0] is not None for p in out.values()):
+                return out
+        except Exception as e:
+            print("❌ parse_yahoo error:", e)
+            traceback.print_exc()
+    
+    # Fallback: получаем по одному тикеру через альтернативный API
+    print("⚠️ Trying alternative Yahoo API (individual requests)...")
+    for k, sym in YF_TICKERS.items():
+        try:
+            url = f"https://query2.finance.yahoo.com/v8/finance/chart/{sym}?interval=1d&range=1d"
+            data = await get_json(session, url, None)
+            if data:
+                result = data.get("chart", {}).get("result", [{}])[0]
+                meta = result.get("meta", {})
+                price = meta.get("regularMarketPrice")
+                cur = meta.get("currency")
+                if price:
+                    out[k] = (float(price), cur)
+                    print(f"  ✅ {k}: {price} {cur}")
+        except Exception as e:
+            print(f"  ❌ {k} failed: {e}")
+    
     return out
 
 # ----------------- PRICES: CoinGecko + fallback Binance -----------------
