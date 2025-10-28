@@ -34,6 +34,7 @@ TIMEOUT = aiohttp.ClientTimeout(total=15)
 YF_TICKERS = {
     "VWCE": "VWCE.DE",
     "GOLD": "4GLD.DE",
+    "XETRA_GOLD": "EWG2.DE",  # X IE Physical Gold ETC
     "SP500": "SPY",
 }
 
@@ -284,10 +285,16 @@ async def daily_report(context: ContextTypes.DEFAULT_TYPE):
         
         # Акции/ETF
         lines.append("<b>📊 Фондовый рынок:</b>")
-        for key in ["VWCE", "GOLD", "SP500"]:
+        for key in ["VWCE", "GOLD", "XETRA_GOLD", "SP500"]:
             price, currency = yf.get(key, (None, None))
             if price:
-                lines.append(f"• {key}: {price:.2f} {currency or ''}")
+                name_map = {
+                    "VWCE": "VWCE",
+                    "GOLD": "4GLD (Gold ETC)",
+                    "XETRA_GOLD": "X IE Physical Gold ETC",
+                    "SP500": "S&P 500 (SPY)"
+                }
+                lines.append(f"• {name_map[key]}: {price:.2f} {currency or ''}")
             else:
                 lines.append(f"• {key}: н/д")
         
@@ -328,10 +335,16 @@ async def weekly_report(context: ContextTypes.DEFAULT_TYPE):
         
         # Акции/ETF
         lines.append("<b>📊 Фондовый рынок:</b>")
-        for key in ["VWCE", "GOLD", "SP500"]:
+        for key in ["VWCE", "GOLD", "XETRA_GOLD", "SP500"]:
             price, currency = yf.get(key, (None, None))
             if price:
-                lines.append(f"• {key}: {price:.2f} {currency or ''}")
+                name_map = {
+                    "VWCE": "VWCE",
+                    "GOLD": "4GLD (Gold ETC)",
+                    "XETRA_GOLD": "X IE Physical Gold ETC",
+                    "SP500": "S&P 500 (SPY)"
+                }
+                lines.append(f"• {name_map[key]}: {price:.2f} {currency or ''}")
         
         # Криптовалюты
         lines.append("\n<b>₿ Криптовалюты:</b>")
@@ -406,10 +419,15 @@ async def cmd_portfolio(update: Update, context: ContextTypes.DEFAULT_TYPE):
         
         # Только VWCE и GOLD
         lines.append("<b>📊 ETF:</b>")
-        for key in ["VWCE", "GOLD"]:
+        for key in ["VWCE", "GOLD", "XETRA_GOLD"]:
             price, currency = yf.get(key, (None, None))
             if price:
-                name = "VWCE" if key == "VWCE" else "X IE Physical Gold ETC EUR"
+                name_map = {
+                    "VWCE": "VWCE",
+                    "GOLD": "4GLD (Gold ETC)",
+                    "XETRA_GOLD": "X IE Physical Gold ETC"
+                }
+                name = name_map[key]
                 lines.append(f"• {name}: {price:.2f} {currency or ''}")
             else:
                 lines.append(f"• {key}: н/д")
@@ -450,10 +468,16 @@ async def cmd_pingprices(update: Update, context: ContextTypes.DEFAULT_TYPE):
         lines = ["💹 <b>Все цены:</b>\n"]
         
         lines.append("<b>📊 Фондовый рынок:</b>")
-        for key in ["SP500", "VWCE", "GOLD"]:
+        for key in ["SP500", "VWCE", "GOLD", "XETRA_GOLD"]:
             price, currency = yf.get(key, (None, None))
             if price:
-                name = {"SP500": "S&P 500 (SPY)", "VWCE": "VWCE", "GOLD": "Gold (ETF)"}[key]
+                name_map = {
+                    "SP500": "S&P 500 (SPY)",
+                    "VWCE": "VWCE",
+                    "GOLD": "4GLD (Gold ETC)",
+                    "XETRA_GOLD": "X IE Physical Gold ETC"
+                }
+                name = name_map[key]
                 lines.append(f"• {name}: {price:.2f} {currency or ''}")
             else:
                 lines.append(f"• {key}: н/д")
