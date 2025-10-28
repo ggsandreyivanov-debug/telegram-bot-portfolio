@@ -56,12 +56,17 @@ last_prices: Dict[str, float] = {}
 async def get_json(session: aiohttp.ClientSession, url: str, params=None) -> Optional[Dict[str, Any]]:
     try:
         async with session.get(url, params=params, headers=HEADERS, timeout=TIMEOUT) as r:
+            print(f"🔍 Request: {url} | Status: {r.status}")
             if r.status != 200:
-                print(f"⚠ {url} -> HTTP {r.status}")
+                text = await r.text()
+                print(f"⚠ {url} -> HTTP {r.status}, Response: {text[:200]}")
                 return None
-            return await r.json()
+            data = await r.json()
+            print(f"✅ Response received, data keys: {list(data.keys()) if isinstance(data, dict) else 'not a dict'}")
+            return data
     except Exception as e:
-        print(f"⚠ get_json({url}) error: {e}")
+        print(f"❌ get_json({url}) error: {e}")
+        traceback.print_exc()
         return None
 
 # ----------------- PRICES: Yahoo Finance -----------------
@@ -71,20 +76,30 @@ async def get_yahoo_prices(session: aiohttp.ClientSession) -> Dict[str, Tuple[Op
     """
     symbols = ",".join(YF_TICKERS.values())
     url = "https://query1.finance.yahoo.com/v7/finance/quote"
+    print(f"📊 Fetching Yahoo Finance: {symbols}")
     data = await get_json(session, url, {"symbols": symbols})
     out: Dict[str, Tuple[Optional[float], Optional[str]]] = {k: (None, None) for k in YF_TICKERS}
 
+    if not data:
+        print("❌ Yahoo Finance returned no data")
+        return out
+
     try:
         res = (data or {}).get("quoteResponse", {}).get("result", [])
+        print(f"📈 Yahoo results count: {len(res)}")
         by_symbol = {it.get("symbol"): it for it in res}
         for k, sym in YF_TICKERS.items():
             item = by_symbol.get(sym)
             if item:
                 price = item.get("regularMarketPrice")
                 cur = item.get("currency")
+                print(f"  • {k} ({sym}): {price} {cur}")
                 out[k] = (float(price) if price is not None else None, cur)
+            else:
+                print(f"  • {k} ({sym}): not found in response")
     except Exception as e:
-        print("⚠ parse_yahoo error:", e, traceback.format_exc())
+        print("❌ parse_yahoo error:", e)
+        traceback.print_exc()
     return out
 
 # ----------------- PRICES: CoinGecko + fallback Binance -----------------
@@ -92,9 +107,11 @@ async def get_coingecko(session: aiohttp.ClientSession) -> Dict[str, Dict[str, O
     ids = ",".join(v[0] for v in COINS.values())
     url = "https://api.coingecko.com/api/v3/simple/price"
     params = {"ids": ids, "vs_currencies": "usd", "include_24hr_change": "true"}
+    print(f"🪙 Fetching CoinGecko: {ids}")
     data = await get_json(session, url, params)
     out: Dict[str, Dict[str, Optional[float]]] = {}
     if not data:
+        print("❌ CoinGecko returned no data")
         return out
 
     # map id->sym
@@ -105,6 +122,7 @@ async def get_coingecko(session: aiohttp.ClientSession) -> Dict[str, Dict[str, O
             continue
         price = payload.get("usd")
         chg = payload.get("usd_24h_change")
+        print(f"  • {sym}: ${price} ({chg:+.2f}% if chg else 'N/A'})")
         out[sym] = {"usd": float(price) if price is not None else None,
                     "change_24h": float(chg) if chg is not None else None}
     return out
