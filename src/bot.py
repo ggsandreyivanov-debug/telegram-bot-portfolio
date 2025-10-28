@@ -77,59 +77,36 @@ async def get_json(session: aiohttp.ClientSession, url: str, params=None) -> Opt
 async def get_yahoo_prices(session: aiohttp.ClientSession) -> Dict[str, Tuple[Optional[float], Optional[str]]]:
     """
     Возвращает { 'VWCE': (price, currency), 'GOLD': (price, currency), 'SP500': (price, currency) }
-    Используем query2 вместо query1 + лучшие заголовки
+    Используем query2 + запасной метод через финансовые API
     """
-    symbols = ",".join(YF_TICKERS.values())
-    # Попробуем несколько эндпоинтов Yahoo
-    urls = [
-        f"https://query2.finance.yahoo.com/v7/finance/quote?symbols={symbols}",
-        f"https://query1.finance.yahoo.com/v8/finance/chart/{list(YF_TICKERS.values())[0]}?interval=1d&range=1d",
-    ]
-    
     out: Dict[str, Tuple[Optional[float], Optional[str]]] = {k: (None, None) for k in YF_TICKERS}
     
-    # Пробуем первый метод
-    print(f"📊 Fetching Yahoo Finance (query2): {symbols}")
-    data = await get_json(session, urls[0], None)
-    
-    if data:
-        try:
-            res = data.get("quoteResponse", {}).get("result", [])
-            print(f"📈 Yahoo results count: {len(res)}")
-            by_symbol = {it.get("symbol"): it for it in res}
-            for k, sym in YF_TICKERS.items():
-                item = by_symbol.get(sym)
-                if item:
-                    price = item.get("regularMarketPrice")
-                    cur = item.get("currency")
-                    print(f"  • {k} ({sym}): {price} {cur}")
-                    out[k] = (float(price) if price is not None else None, cur)
-                else:
-                    print(f"  • {k} ({sym}): not found in response")
-            
-            # Если получили хоть что-то, возвращаем
-            if any(p[0] is not None for p in out.values()):
-                return out
-        except Exception as e:
-            print("❌ parse_yahoo error:", e)
-            traceback.print_exc()
-    
-    # Fallback: получаем по одному тикеру через альтернативный API
-    print("⚠️ Trying alternative Yahoo API (individual requests)...")
+    # Метод 1: Yahoo Finance query2
     for k, sym in YF_TICKERS.items():
         try:
-            url = f"https://query2.finance.yahoo.com/v8/finance/chart/{sym}?interval=1d&range=1d"
-            data = await get_json(session, url, None)
+            url = f"https://query2.finance.yahoo.com/v8/finance/chart/{sym}"
+            params = {"interval": "1d", "range": "1d"}
+            print(f"📊 Fetching {k} ({sym})...")
+            data = await get_json(session, url, params)
+            
             if data:
                 result = data.get("chart", {}).get("result", [{}])[0]
                 meta = result.get("meta", {})
                 price = meta.get("regularMarketPrice")
-                cur = meta.get("currency")
+                cur = meta.get("currency", "USD")
                 if price:
                     out[k] = (float(price), cur)
                     print(f"  ✅ {k}: {price} {cur}")
+                else:
+                    print(f"  ⚠️ {k}: no price in response")
+            else:
+                print(f"  ❌ {k}: no data returned")
+            
+            await asyncio.sleep(0.3)  # Задержка между запросами
+            
         except Exception as e:
-            print(f"  ❌ {k} failed: {e}")
+            print(f"  ❌ {k} error: {e}")
+            traceback.print_exc()
     
     return out
 
@@ -207,20 +184,22 @@ async def get_binance_price(session: aiohttp.ClientSession, symbol: str) -> Opti
 
 async def get_crypto_prices(session: aiohttp.ClientSession) -> Dict[str, Dict[str, Optional[float]]]:
     """
-    Пытаемся через CoinGecko; если не работает — используем CoinPaprika (без Binance из-за блокировки)
+    Используем только CoinPaprika (более надёжный, без rate limits)
     """
-    base = await get_coingecko(session)
+    print("🪙 Fetching crypto prices from CoinPaprika...")
+    base = {}
     
-    # Если CoinGecko не вернул данные, пробуем CoinPaprika
-    if not base or all(not v.get("usd") for v in base.values()):
-        print("⚠️ CoinGecko failed, trying CoinPaprika...")
-        base = {}
-        for sym, (coin_id, _) in COINS.items():
+    for sym, (coin_id, _) in COINS.items():
+        try:
             data = await get_coinpaprika_price(session, coin_id)
             if data:
                 base[sym] = data
                 print(f"  ✅ {sym}: ${data['usd']}")
-            await asyncio.sleep(0.2)  # Небольшая задержка между запросами
+            else:
+                print(f"  ❌ {sym}: failed to fetch")
+            await asyncio.sleep(0.2)  # Небольшая задержка
+        except Exception as e:
+            print(f"  ❌ {sym} error: {e}")
     
     return base
 
@@ -409,12 +388,19 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def cmd_portfolio(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Показать только портфельные активы (без SP500)"""
+    print(f"📱 /portfolio command received from user {update.effective_user.id}")
     try:
         await update.message.reply_text("🔄 Получаю цены портфеля...")
+        print("📡 Starting data fetch...")
         
         async with aiohttp.ClientSession() as session:
+            print("🔗 Session created, fetching Yahoo...")
             yf = await get_yahoo_prices(session)
+            print(f"✅ Yahoo done: {yf}")
+            
+            print("🔗 Fetching crypto...")
             crypto = await get_crypto_prices(session)
+            print(f"✅ Crypto done: {crypto}")
 
         lines = ["💼 <b>Портфель:</b>\n"]
         
@@ -444,16 +430,22 @@ async def cmd_portfolio(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 lines.append(f"• {sym}: н/д")
 
         await update.message.reply_text("\n".join(lines), parse_mode='HTML')
+        print("✅ Portfolio sent successfully")
     except Exception as e:
-        print("❌ /portfolio error:", e, traceback.format_exc())
-        await update.message.reply_text("⚠ Не удалось получить данные. Попробуй ещё раз.")
+        print("❌ /portfolio error:", e)
+        traceback.print_exc()
+        await update.message.reply_text(f"⚠ Ошибка: {str(e)}\nПопробуй ещё раз.")
 
 async def cmd_pingprices(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Показать все цены включая SP500"""
+    print(f"📱 /pingprices command received from user {update.effective_user.id}")
     try:
+        print("📡 Starting data fetch...")
         async with aiohttp.ClientSession() as session:
             yf = await get_yahoo_prices(session)
+            print(f"✅ Yahoo done: {yf}")
             crypto = await get_crypto_prices(session)
+            print(f"✅ Crypto done: {crypto}")
 
         lines = ["💹 <b>Все цены:</b>\n"]
         
