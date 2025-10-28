@@ -139,10 +139,14 @@ async def get_coingecko(session: aiohttp.ClientSession) -> Dict[str, Dict[str, O
     url = "https://api.coingecko.com/api/v3/simple/price"
     params = {"ids": ids, "vs_currencies": "usd", "include_24hr_change": "true"}
     print(f"🪙 Fetching CoinGecko: {ids}")
+    
+    # Добавляем задержку между запросами для избежания rate limit
+    await asyncio.sleep(1)
+    
     data = await get_json(session, url, params)
     out: Dict[str, Dict[str, Optional[float]]] = {}
     if not data:
-        print("❌ CoinGecko returned no data")
+        print("❌ CoinGecko returned no data (rate limited or blocked)")
         return out
 
     # map id->sym
@@ -153,10 +157,43 @@ async def get_coingecko(session: aiohttp.ClientSession) -> Dict[str, Dict[str, O
             continue
         price = payload.get("usd")
         chg = payload.get("usd_24h_change")
-        print(f"  • {sym}: ${price} ({chg:+.2f}% if chg else 'N/A'})")
+        chg_str = f"{chg:+.2f}%" if chg else "N/A"
+        print(f"  • {sym}: ${price} ({chg_str})")
         out[sym] = {"usd": float(price) if price is not None else None,
                     "change_24h": float(chg) if chg is not None else None}
     return out
+
+async def get_coinpaprika_price(session: aiohttp.ClientSession, coin_id: str) -> Optional[Dict[str, float]]:
+    """Альтернатива CoinGecko - CoinPaprika (без rate limits на free tier)"""
+    # Маппинг на CoinPaprika IDs
+    paprika_map = {
+        "bitcoin": "btc-bitcoin",
+        "ethereum": "eth-ethereum",
+        "solana": "sol-solana",
+        "avalanche-2": "avax-avalanche",
+        "dogecoin": "doge-dogecoin",
+        "chainlink": "link-chainlink",
+    }
+    
+    paprika_id = paprika_map.get(coin_id)
+    if not paprika_id:
+        return None
+    
+    url = f"https://api.coinpaprika.com/v1/tickers/{paprika_id}"
+    try:
+        data = await get_json(session, url, None)
+        if data:
+            quotes = data.get("quotes", {}).get("USD", {})
+            price = quotes.get("price")
+            change_24h = quotes.get("percent_change_24h")
+            if price:
+                return {
+                    "usd": float(price),
+                    "change_24h": float(change_24h) if change_24h else None
+                }
+    except Exception as e:
+        print(f"❌ CoinPaprika {coin_id} error: {e}")
+    return None
 
 async def get_binance_price(session: aiohttp.ClientSession, symbol: str) -> Optional[float]:
     url = "https://api.binance.com/api/v3/ticker/price"
@@ -170,21 +207,21 @@ async def get_binance_price(session: aiohttp.ClientSession, symbol: str) -> Opti
 
 async def get_crypto_prices(session: aiohttp.ClientSession) -> Dict[str, Dict[str, Optional[float]]]:
     """
-    Пытаемся через CoinGecko; что не пришло — дотягиваем ценой с Binance (без % изменения).
+    Пытаемся через CoinGecko; если не работает — используем CoinPaprika (без Binance из-за блокировки)
     """
     base = await get_coingecko(session)
-    # fallback для пустых
-    tasks: List[Tuple[str, str]] = []
-    for sym, (_, bin_sym) in COINS.items():
-        if sym not in base or base[sym].get("usd") is None:
-            tasks.append((sym, bin_sym))
-
-    for sym, bin_sym in tasks:
-        price = await get_binance_price(session, bin_sym)
-        if price is not None:
-            base.setdefault(sym, {})["usd"] = price
-            base[sym].setdefault("change_24h", None)
-
+    
+    # Если CoinGecko не вернул данные, пробуем CoinPaprika
+    if not base or all(not v.get("usd") for v in base.values()):
+        print("⚠️ CoinGecko failed, trying CoinPaprika...")
+        base = {}
+        for sym, (coin_id, _) in COINS.items():
+            data = await get_coinpaprika_price(session, coin_id)
+            if data:
+                base[sym] = data
+                print(f"  ✅ {sym}: ${data['usd']}")
+            await asyncio.sleep(0.2)  # Небольшая задержка между запросами
+    
     return base
 
 # ----------------- MONITORING LOGIC -----------------
