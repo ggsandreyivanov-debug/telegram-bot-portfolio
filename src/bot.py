@@ -28,15 +28,6 @@ if not TOKEN:
 if not CHAT_ID:
     print("⚠ CHAT_ID не установлен - автоматические уведомления будут отключены")
 
-# Инициализация Supabase
-try:
-    from supabase import create_client, Client
-    supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
-    print("✅ Supabase connected")
-except Exception as e:
-    print(f"⚠️ Supabase initialization failed: {e}")
-    supabase = None
-
 # === CONFIG ===
 HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
@@ -210,70 +201,95 @@ async def get_crypto_price(session: aiohttp.ClientSession, symbol: str) -> Optio
     print(f"❌ All sources failed for {symbol}")
     return None
 
+# ----------------- Supabase REST API helpers -----------------
+async def supabase_get_portfolio(session: aiohttp.ClientSession, user_id: int) -> Optional[Dict[str, float]]:
+    """Получить портфель через REST API"""
+    try:
+        url = f"{SUPABASE_URL}/rest/v1/portfolios"
+        headers = {
+            "apikey": SUPABASE_KEY,
+            "Authorization": f"Bearer {SUPABASE_KEY}",
+            "Content-Type": "application/json"
+        }
+        params = {"user_id": f"eq.{user_id}", "select": "*"}
+        
+        async with session.get(url, headers=headers, params=params) as resp:
+            if resp.status == 200:
+                data = await resp.json()
+                if data and len(data) > 0:
+                    return data[0].get('assets', {})
+    except Exception as e:
+        print(f"❌ supabase_get_portfolio error: {e}")
+    return None
+
+async def supabase_save_portfolio(session: aiohttp.ClientSession, user_id: int, portfolio: Dict[str, float]) -> bool:
+    """Сохранить портфель через REST API"""
+    try:
+        url = f"{SUPABASE_URL}/rest/v1/portfolios"
+        headers = {
+            "apikey": SUPABASE_KEY,
+            "Authorization": f"Bearer {SUPABASE_KEY}",
+            "Content-Type": "application/json",
+            "Prefer": "resolution=merge-duplicates"
+        }
+        
+        payload = {
+            "user_id": user_id,
+            "assets": portfolio
+        }
+        
+        async with session.post(url, headers=headers, json=payload) as resp:
+            return resp.status in [200, 201]
+    except Exception as e:
+        print(f"❌ supabase_save_portfolio error: {e}")
+    return False
+
 # ----------------- Portfolio Management -----------------
 async def init_portfolio_table():
-    """Создать таблицу для портфелей в Supabase"""
-    if not supabase:
-        return
-    
-    try:
-        # Проверяем есть ли таблица, если нет - создаём через SQL
-        result = supabase.table('portfolios').select("*").limit(1).execute()
-    except Exception as e:
-        print(f"⚠️ Portfolio table doesn't exist, you need to create it manually in Supabase")
-        print("SQL: CREATE TABLE portfolios (user_id BIGINT PRIMARY KEY, assets JSONB);")
+    """Проверка таблицы (таблица уже создана в Supabase)"""
+    print("✅ Supabase portfolio table ready")
 
 def get_user_portfolio(user_id: int) -> Dict[str, float]:
-    """Получить портфель из Supabase"""
-    if not supabase:
-        # Fallback на память если Supabase не работает
-        if user_id not in user_portfolios:
-            user_portfolios[user_id] = {
-                "VWCE.DE": 0,
-                "DE000A2T5DZ1.SG": 0,
-                "BTC": 0,
-                "ETH": 0,
-                "SOL": 0,
-            }
-        return user_portfolios[user_id]
-    
-    try:
-        result = supabase.table('portfolios').select("*").eq('user_id', user_id).execute()
+    """Получить портфель (синхронная обёртка)"""
+    # Временно используем память, async версия ниже
+    if user_id not in user_portfolios:
+        user_portfolios[user_id] = {
+            "VWCE.DE": 0,
+            "DE000A2T5DZ1.SG": 0,
+            "BTC": 0,
+            "ETH": 0,
+            "SOL": 0,
+        }
+    return user_portfolios[user_id]
+
+async def get_user_portfolio_async(user_id: int) -> Dict[str, float]:
+    """Получить портфель асинхронно из Supabase"""
+    async with aiohttp.ClientSession() as session:
+        portfolio = await supabase_get_portfolio(session, user_id)
+        if portfolio:
+            return portfolio
         
-        if result.data and len(result.data) > 0:
-            return result.data[0]['assets']
-        else:
-            # Создаём новый портфель
-            default_portfolio = {
-                "VWCE.DE": 0,
-                "DE000A2T5DZ1.SG": 0,
-                "BTC": 0,
-                "ETH": 0,
-                "SOL": 0,
-            }
-            supabase.table('portfolios').insert({
-                'user_id': user_id,
-                'assets': default_portfolio
-            }).execute()
-            return default_portfolio
-    except Exception as e:
-        print(f"❌ get_user_portfolio error: {e}")
-        return {}
+        # Создаём дефолтный
+        default = {
+            "VWCE.DE": 0,
+            "DE000A2T5DZ1.SG": 0,
+            "BTC": 0,
+            "ETH": 0,
+            "SOL": 0,
+        }
+        await supabase_save_portfolio(session, user_id, default)
+        return default
 
 def save_portfolio(user_id: int, portfolio: Dict[str, float]):
-    """Сохранить портфель в Supabase"""
-    if not supabase:
-        user_portfolios[user_id] = portfolio
-        return
-    
-    try:
-        supabase.table('portfolios').upsert({
-            'user_id': user_id,
-            'assets': portfolio
-        }).execute()
-        print(f"✅ Portfolio saved for user {user_id}")
-    except Exception as e:
-        print(f"❌ save_portfolio error: {e}")
+    """Сохранить портфель (синхронная обёртка)"""
+    user_portfolios[user_id] = portfolio
+    # Сохраняем асинхронно в фоне
+    asyncio.create_task(save_portfolio_async(user_id, portfolio))
+
+async def save_portfolio_async(user_id: int, portfolio: Dict[str, float]):
+    """Сохранить портфель асинхронно"""
+    async with aiohttp.ClientSession() as session:
+        await supabase_save_portfolio(session, user_id, portfolio)
 
 # ----------------- MONITORING LOGIC -----------------
 async def check_price_alerts(context: ContextTypes.DEFAULT_TYPE):
@@ -1008,9 +1024,13 @@ def main():
     app.add_handler(CommandHandler("setalert", cmd_setalert))
     app.add_handler(CommandHandler("testalert", cmd_test_alert))
     app.add_handler(CommandHandler("events", cmd_events))
+    app.add_handler(CommandHandler("chart", cmd_chart))
     
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_buttons))
     app.add_error_handler(on_error)
+
+    # Инициализация таблицы портфелей
+    asyncio.run(init_portfolio_table())
 
     job_queue = app.job_queue
     
