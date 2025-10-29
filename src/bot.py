@@ -1,3 +1,6 @@
+# BOT VERSION: 2025-10-29-PYTHON313-FIX-v2
+# This version includes Python 3.13 event loop compatibility fix
+
 import os
 import math
 import asyncio
