@@ -19,6 +19,8 @@ from telegram.ext import (
 # === ENV ===
 TOKEN = os.getenv("BOT_TOKEN")
 CHAT_ID = os.getenv("CHAT_ID")
+LUNARCRUSH_API_KEY = os.getenv("LUNARCRUSH_API_KEY", "lsnio8kvswz9egysxeb8tzybcmhc2zcuee74kwz")
+
 if not TOKEN:
     raise RuntimeError("⚠ BOT_TOKEN is not set in environment!")
 if not CHAT_ID:
@@ -130,7 +132,152 @@ async def get_crypto_price(session: aiohttp.ClientSession, symbol: str) -> Optio
     return None
 
 # ----------------- EVENTS & NEWS -----------------
-async def get_crypto_events(session: aiohttp.ClientSession) -> List[Dict[str, Any]]:
+async def get_fear_greed_index(session: aiohttp.ClientSession) -> Optional[int]:
+    """Получить индекс страха и жадности (0-100)"""
+    try:
+        url = "https://api.alternative.me/fng/"
+        data = await get_json(session, url, None)
+        if data and "data" in data:
+            return int(data["data"][0]["value"])
+    except Exception as e:
+        print(f"❌ Fear & Greed error: {e}")
+    return None
+
+async def get_lunarcrush_sentiment(session: aiohttp.ClientSession, symbol: str) -> Optional[Dict[str, float]]:
+    """Получить sentiment score с LunarCrush"""
+    try:
+        # Маппинг символов для LunarCrush
+        symbol_map = {
+            "BTC": "BTC",
+            "ETH": "ETH",
+            "SOL": "SOL",
+            "AVAX": "AVAX",
+            "DOGE": "DOGE",
+            "LINK": "LINK"
+        }
+        
+        lc_symbol = symbol_map.get(symbol)
+        if not lc_symbol:
+            return None
+        
+        url = "https://lunarcrush.com/api4/public/coins/list/v2"
+        headers = {
+            **HEADERS,
+            "Authorization": f"Bearer {LUNARCRUSH_API_KEY}"
+        }
+        
+        params = {"symbol": lc_symbol}
+        
+        async with session.get(url, params=params, headers=headers, timeout=TIMEOUT) as r:
+            if r.status == 200:
+                data = await r.json()
+                if data and "data" in data and len(data["data"]) > 0:
+                    coin = data["data"][0]
+                    
+                    # Извлекаем метрики
+                    galaxy_score = coin.get("galaxy_score", 50)  # 0-100
+                    alt_rank = coin.get("alt_rank", 500)  # Рейтинг (меньше = лучше)
+                    sentiment = coin.get("sentiment", 3)  # 1-5
+                    
+                    # Нормализуем sentiment (1-5 → 0-100)
+                    sentiment_score = ((sentiment - 1) / 4) * 100
+                    
+                    # Нормализуем rank (топ 100 = хорошо)
+                    rank_score = max(0, 100 - (alt_rank / 5))
+                    
+                    return {
+                        "galaxy_score": galaxy_score,
+                        "sentiment_score": sentiment_score,
+                        "rank_score": rank_score,
+                        "overall": (galaxy_score + sentiment_score + rank_score) / 3
+                    }
+    except Exception as e:
+        print(f"❌ LunarCrush {symbol} error: {e}")
+    return None
+
+async def calculate_trend_score(session: aiohttp.ClientSession, symbol: str) -> float:
+    """Рассчитать тренд на основе 7-дневных данных"""
+    try:
+        # Для крипты используем CoinPaprika historical
+        if symbol in CRYPTO_IDS:
+            paprika_id = CRYPTO_IDS[symbol]["paprika"]
+            url = f"https://api.coinpaprika.com/v1/tickers/{paprika_id}/historical"
+            
+            from datetime import datetime, timedelta
+            end = datetime.now()
+            start = end - timedelta(days=7)
+            
+            params = {
+                "start": start.strftime("%Y-%m-%d"),
+                "end": end.strftime("%Y-%m-%d"),
+                "interval": "1d"
+            }
+            
+            data = await get_json(session, url, params)
+            if data and len(data) >= 2:
+                first_price = data[0].get("price", 0)
+                last_price = data[-1].get("price", 0)
+                
+                if first_price > 0:
+                    change_pct = ((last_price - first_price) / first_price) * 100
+                    # Конвертируем в score 0-100
+                    # +20% = 100, -20% = 0
+                    trend_score = 50 + (change_pct * 2.5)
+                    return max(0, min(100, trend_score))
+    except Exception as e:
+        print(f"❌ Trend calculation error: {e}")
+    
+    return 50.0  # Нейтральный тренд по умолчанию
+
+async def calculate_probability(session: aiohttp.ClientSession, symbol: str, event_impact: str) -> Dict[str, Any]:
+    """Рассчитать вероятность роста на основе multiple факторов"""
+    
+    # Базовая вероятность по типу события
+    impact_scores = {
+        "Критический": 30,  # Высокая неопределённость
+        "Высокий": 20,
+        "Средний": 10,
+        "Низкий": 5
+    }
+    
+    event_score = impact_scores.get(event_impact, 10)
+    
+    # Получаем данные
+    fear_greed = await get_fear_greed_index(session) or 50
+    sentiment_data = await get_lunarcrush_sentiment(session, symbol) or {"overall": 50}
+    trend_score = await calculate_trend_score(session, symbol)
+    
+    # Формула: взвешенная сумма
+    probability = (
+        fear_greed * 0.25 +           # 25% - общее настроение рынка
+        sentiment_data["overall"] * 0.30 +  # 30% - sentiment конкретной монеты
+        trend_score * 0.30 +          # 30% - недавний тренд
+        event_score * 0.15            # 15% - влияние события
+    )
+    
+    probability = max(20, min(80, probability))  # Ограничиваем 20-80%
+    
+    # Определяем прогноз
+    if probability >= 60:
+        prediction = f"📈 Рост вероятен ({probability:.0f}%)"
+        price_change = f"+{(probability - 50) * 0.15:.1f}%"
+    elif probability <= 40:
+        prediction = f"📉 Падение вероятно ({100 - probability:.0f}%)"
+        price_change = f"-{(50 - probability) * 0.15:.1f}%"
+    else:
+        prediction = f"📊 Нейтрально ({probability:.0f}%)"
+        price_change = "±1-2%"
+    
+    return {
+        "probability": probability,
+        "prediction": prediction,
+        "price_change": price_change,
+        "factors": {
+            "fear_greed": fear_greed,
+            "sentiment": sentiment_data["overall"],
+            "trend": trend_score
+        }
+    }
     """Получить события для криптовалют с CoinMarketCal (бесплатный API)"""
     events = []
     
