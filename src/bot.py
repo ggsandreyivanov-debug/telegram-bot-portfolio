@@ -259,19 +259,23 @@ async def calculate_probability(session: aiohttp.ClientSession, symbol: str, eve
     
     # Определяем прогноз
     if probability >= 60:
-        prediction = f"📈 Рост вероятен ({probability:.0f}%)"
+        prediction = f"📈 Рост вероятен"
         price_change = f"+{(probability - 50) * 0.15:.1f}%"
+        confidence = "высокая"
     elif probability <= 40:
-        prediction = f"📉 Падение вероятно ({100 - probability:.0f}%)"
+        prediction = f"📉 Падение вероятно"
         price_change = f"-{(50 - probability) * 0.15:.1f}%"
+        confidence = "высокая"
     else:
-        prediction = f"📊 Нейтрально ({probability:.0f}%)"
+        prediction = f"📊 Нейтрально"
         price_change = "±1-2%"
+        confidence = "средняя"
     
     return {
         "probability": probability,
         "prediction": prediction,
         "price_change": price_change,
+        "confidence": confidence,
         "factors": {
             "fear_greed": fear_greed,
             "sentiment": sentiment_data["overall"],
@@ -1042,10 +1046,17 @@ async def cmd_events(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     impact = event.get("impact", "")
                     pred = event.get("prediction", "")
                     prob = event.get("probability", 50)
+                    price_change = event.get("price_change", "")
+                    confidence = event.get("confidence", "средняя")
                     
                     lines.append(f"\n📅 <b>{date}</b> | {asset}")
-                    lines.append(f"{title}")
-                    lines.append(f"<i>{impact} | {pred} (вероятность: {prob:.0f}%)</i>")
+                    lines.append(f"📌 {title}")
+                    lines.append(f"🎯 Влияние: {impact}")
+                    lines.append(f"💡 Прогноз: {pred}")
+                    lines.append(f"📊 Ожидаемое изменение: {price_change}")
+                    lines.append(f"🔮 Уверенность прогноза: {confidence} ({prob:.0f}/100)")
+                    lines.append("")
+                    lines.append(f"<i>Факторы: рыночный сентимент, тренд 7д, соц.активность</i>")
             
             if not stock_events and not crypto_events:
                 lines.append("<i>Нет важных событий на эту неделю</i>")
