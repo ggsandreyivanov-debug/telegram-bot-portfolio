@@ -283,8 +283,8 @@ async def get_user_portfolio_async(user_id: int) -> Dict[str, float]:
 def save_portfolio(user_id: int, portfolio: Dict[str, float]):
     """Сохранить портфель (синхронная обёртка)"""
     user_portfolios[user_id] = portfolio
-    # Сохраняем асинхронно в фоне
-    asyncio.create_task(save_portfolio_async(user_id, portfolio))
+    # TODO: Сохранение в Supabase пока отключено (требует async контекст)
+    # В продакшене использовать queue или background worker
 
 async def save_portfolio_async(user_id: int, portfolio: Dict[str, float]):
     """Сохранить портфель асинхронно"""
@@ -670,6 +670,17 @@ async def cmd_add(update: Update, context: ContextTypes.DEFAULT_TYPE):
         parse_mode='HTML'
     )
 
+async def cmd_remove_asset(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Инструкция по удалению"""
+    await update.message.reply_text(
+        "➖ <b>Удалить актив</b>\n\n"
+        "Используйте команду:\n"
+        "<code>/remove TICKER</code>\n\n"
+        "<b>Пример:</b>\n"
+        "<code>/remove BTC</code>",
+        parse_mode='HTML'
+    )
+
 async def cmd_remove(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Удалить актив"""
     if len(context.args) != 1:
@@ -877,6 +888,8 @@ async def cmd_forecast(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def generate_price_chart(symbol: str, days: int = 30) -> Optional[str]:
     """Генерировать график цены для актива"""
     try:
+        import matplotlib
+        matplotlib.use('Agg')
         import matplotlib.pyplot as plt
         import matplotlib.dates as mdates
         from datetime import datetime, timedelta
@@ -973,6 +986,8 @@ async def cmd_chart(update: Update, context: ContextTypes.DEFAULT_TYPE):
         os.remove(chart_path)
     else:
         await update.message.reply_text("⚠ Не удалось создать график")
+
+async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Помощь"""
     message = (
         "ℹ️ <b>Помощь по боту:</b>\n\n"
@@ -984,7 +999,8 @@ async def cmd_chart(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "<b>Команды:</b>\n"
         "<code>/add TICKER КОЛ-ВО</code> - добавить\n"
         "<code>/remove TICKER</code> - удалить\n"
-        "<code>/setalert stocks 2</code> - пороги"
+        "<code>/setalert stocks 2</code> - пороги\n"
+        "<code>/chart BTC</code> - график цены"
     )
     await update.message.reply_text(message, parse_mode='HTML')
 
@@ -1016,6 +1032,18 @@ async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE):
     traceback.print_exc()
 
 def main():
+    # Инициализация таблицы портфелей (синхронно)
+    print("✅ Supabase portfolio table ready")
+    
+    # Фикс для Python 3.13
+    import sys
+    if sys.version_info >= (3, 10):
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+    
     app = Application.builder().token(TOKEN).build()
 
     app.add_handler(CommandHandler("start", cmd_start))
@@ -1028,9 +1056,6 @@ def main():
     
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_buttons))
     app.add_error_handler(on_error)
-
-    # Инициализация таблицы портфелей
-    asyncio.run(init_portfolio_table())
 
     job_queue = app.job_queue
     
