@@ -1,5 +1,5 @@
-# BOT VERSION: 2025-10-29-PYTHON313-FIX-v2
-# This version includes Python 3.13 event loop compatibility fix
+# BOT VERSION: 2025-10-29-TRADES-AND-SIGNALS-v2.0
+# This version includes trade management and trading signals
 
 import os
 import math
@@ -57,6 +57,34 @@ CRYPTO_IDS = {
     "LINK": {"coingecko": "chainlink", "paprika": "link-chainlink", "name": "Chainlink"},
 }
 
+# Типы инвесторов
+INVESTOR_TYPES = {
+    "long": {
+        "name": "Долгосрочный инвестор",
+        "target_profit": 20.0,  # целевая прибыль %
+        "hold_days": 90,  # минимальный срок удержания
+        "buy_threshold": -15.0,  # покупать при падении %
+        "sell_threshold": 25.0,  # продавать при росте %
+    },
+    "swing": {
+        "name": "Свинг-трейдер",
+        "target_profit": 10.0,
+        "hold_days": 7,
+        "buy_threshold": -5.0,
+        "sell_threshold": 10.0,
+    },
+    "day": {
+        "name": "Дневной трейдер",
+        "target_profit": 3.0,
+        "hold_days": 1,
+        "buy_threshold": -2.0,
+        "sell_threshold": 3.0,
+    }
+}
+
+# Хранилище профилей инвесторов
+user_investor_types: Dict[int, str] = {}  # user_id -> investor_type
+
 # Пороги для алертов
 THRESHOLDS = {
     "stocks": 1.0,
@@ -73,9 +101,10 @@ last_prices: Dict[str, float] = {}
 def get_main_menu():
     keyboard = [
         [KeyboardButton("💼 Мой портфель"), KeyboardButton("💹 Все цены")],
+        [KeyboardButton("📈 Мои сделки"), KeyboardButton("💰 Добавить сделку")],
+        [KeyboardButton("🎯 Сигналы"), KeyboardButton("👤 Тип инвестора")],
         [KeyboardButton("📰 События недели"), KeyboardButton("📊 Прогнозы")],
-        [KeyboardButton("➕ Добавить актив"), KeyboardButton("➖ Удалить актив")],
-        [KeyboardButton("⚙️ Настройки алертов"), KeyboardButton("ℹ️ Помощь")],
+        [KeyboardButton("⚙️ Настройки"), KeyboardButton("ℹ️ Помощь")],
     ]
     return ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
 
@@ -294,6 +323,81 @@ async def save_portfolio_async(user_id: int, portfolio: Dict[str, float]):
     async with aiohttp.ClientSession() as session:
         await supabase_save_portfolio(session, user_id, portfolio)
 
+# ----------------- TRADES MANAGEMENT -----------------
+async def supabase_add_trade(session: aiohttp.ClientSession, user_id: int, trade_data: dict) -> bool:
+    """Добавить сделку в Supabase"""
+    try:
+        url = f"{SUPABASE_URL}/rest/v1/trades"
+        headers = {
+            "apikey": SUPABASE_KEY,
+            "Authorization": f"Bearer {SUPABASE_KEY}",
+            "Content-Type": "application/json",
+            "Prefer": "return=representation"
+        }
+        
+        payload = {
+            "user_id": user_id,
+            "symbol": trade_data["symbol"],
+            "quantity": trade_data["quantity"],
+            "entry_price": trade_data["entry_price"],
+            "target_profit": trade_data.get("target_profit", 10.0),
+            "status": "open",
+            "created_at": trade_data.get("created_at")
+        }
+        
+        async with session.post(url, headers=headers, json=payload) as resp:
+            return resp.status in [200, 201]
+    except Exception as e:
+        print(f"❌ supabase_add_trade error: {e}")
+    return False
+
+async def supabase_get_trades(session: aiohttp.ClientSession, user_id: int, status: str = "open") -> List[dict]:
+    """Получить сделки пользователя"""
+    try:
+        url = f"{SUPABASE_URL}/rest/v1/trades"
+        headers = {
+            "apikey": SUPABASE_KEY,
+            "Authorization": f"Bearer {SUPABASE_KEY}",
+            "Content-Type": "application/json"
+        }
+        params = {
+            "user_id": f"eq.{user_id}",
+            "status": f"eq.{status}",
+            "select": "*",
+            "order": "created_at.desc"
+        }
+        
+        async with session.get(url, headers=headers, params=params) as resp:
+            if resp.status == 200:
+                return await resp.json()
+    except Exception as e:
+        print(f"❌ supabase_get_trades error: {e}")
+    return []
+
+async def supabase_close_trade(session: aiohttp.ClientSession, trade_id: int, exit_price: float) -> bool:
+    """Закрыть сделку"""
+    try:
+        url = f"{SUPABASE_URL}/rest/v1/trades"
+        headers = {
+            "apikey": SUPABASE_KEY,
+            "Authorization": f"Bearer {SUPABASE_KEY}",
+            "Content-Type": "application/json"
+        }
+        params = {"id": f"eq.{trade_id}"}
+        
+        from datetime import datetime
+        payload = {
+            "status": "closed",
+            "exit_price": exit_price,
+            "closed_at": datetime.now().isoformat()
+        }
+        
+        async with session.patch(url, headers=headers, params=params, json=payload) as resp:
+            return resp.status == 200
+    except Exception as e:
+        print(f"❌ supabase_close_trade error: {e}")
+    return False
+
 # ----------------- MONITORING LOGIC -----------------
 async def check_price_alerts(context: ContextTypes.DEFAULT_TYPE):
     """Проверка цен каждые 10 минут"""
@@ -371,6 +475,65 @@ async def check_price_alerts(context: ContextTypes.DEFAULT_TYPE):
     
     except Exception as e:
         print(f"❌ check_price_alerts error: {e}")
+        traceback.print_exc()
+
+async def check_trade_profits(context: ContextTypes.DEFAULT_TYPE):
+    """Проверка прибыли по сделкам"""
+    print("💰 Checking trade profits...")
+    
+    try:
+        async with aiohttp.ClientSession() as session:
+            # Получаем всех пользователей с открытыми сделками
+            # (в реальности нужно получить список user_id)
+            # Пока проверим для CHAT_ID если установлен
+            if not CHAT_ID:
+                return
+            
+            user_id = int(CHAT_ID)
+            trades = await supabase_get_trades(session, user_id, "open")
+            
+            if not trades:
+                return
+            
+            alerts = []
+            
+            for trade in trades:
+                symbol = trade['symbol']
+                quantity = trade['quantity']
+                entry_price = trade['entry_price']
+                target_profit = trade['target_profit']
+                trade_id = trade['id']
+                
+                # Получаем текущую цену
+                crypto_data = await get_crypto_price(session, symbol)
+                
+                if not crypto_data:
+                    continue
+                
+                current_price = crypto_data["usd"]
+                profit_pct = ((current_price - entry_price) / entry_price) * 100
+                profit_usd = (current_price - entry_price) * quantity
+                
+                # Если достигнута цель - отправляем алерт
+                if profit_pct >= target_profit:
+                    alerts.append(
+                        f"🎯 <b>Цель достигнута!</b>\n\n"
+                        f"💎 {symbol} (ID: {trade_id})\n"
+                        f"📊 Прибыль: ${profit_usd:,.2f} (+{profit_pct:.2f}%)\n"
+                        f"💵 Текущая цена: ${current_price:,.2f}\n\n"
+                        f"💡 Рекомендация: <b>ПРОДАВАТЬ</b>\n"
+                        f"Закрыть сделку: /close {trade_id}"
+                    )
+                    print(f"  🚨 PROFIT ALERT! {symbol} reached {profit_pct:.2f}%")
+            
+            if alerts:
+                for alert in alerts:
+                    await context.bot.send_message(chat_id=CHAT_ID, text=alert, parse_mode='HTML')
+                    await asyncio.sleep(1)
+                print(f"📤 Sent {len(alerts)} profit alerts")
+    
+    except Exception as e:
+        print(f"❌ check_trade_profits error: {e}")
         traceback.print_exc()
 
 async def daily_report(context: ContextTypes.DEFAULT_TYPE):
@@ -994,6 +1157,348 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Помощь"""
     message = (
         "ℹ️ <b>Помощь по боту:</b>\n\n"
+        "<b>💼 Портфель:</b>\n"
+        "• Мой портфель - текущий портфель\n"
+        "• Все цены - актуальные цены\n\n"
+        "<b>📈 Сделки:</b>\n"
+        "• /trade SYMBOL QTY PRICE - открыть сделку\n"
+        "  Пример: /trade BTC 0.5 50000\n"
+        "• /trades - список открытых сделок\n"
+        "• /close ID - закрыть сделку\n"
+        "• /profit - статистика прибыли\n\n"
+        "<b>🎯 Сигналы:</b>\n"
+        "• /signals - получить торговые сигналы\n"
+        "• /investor - выбрать тип инвестора\n\n"
+        "<b>Другие команды:</b>\n"
+        "• /chart BTC - график цены\n"
+        "• /setalert stocks 2 - пороги\n"
+    )
+    await update.message.reply_text(message, parse_mode='HTML')
+
+# ----------------- TRADE COMMANDS -----------------
+async def cmd_trade(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Открыть новую сделку"""
+    if len(context.args) < 3:
+        await update.message.reply_text(
+            "❌ Неверный формат!\n\n"
+            "Используйте:\n"
+            "<code>/trade SYMBOL КОЛИЧЕСТВО ЦЕНА_ВХОДА [ЦЕЛЕВАЯ_ПРИБЫЛЬ%]</code>\n\n"
+            "<b>Примеры:</b>\n"
+            "<code>/trade BTC 0.5 50000</code>\n"
+            "<code>/trade ETH 2 3000 15</code> (цель +15%)\n\n"
+            "<b>Доступно:</b> BTC, ETH, SOL, AVAX, DOGE, LINK",
+            parse_mode='HTML'
+        )
+        return
+    
+    symbol = context.args[0].upper()
+    
+    if symbol not in CRYPTO_IDS:
+        await update.message.reply_text(
+            f"❌ Неизвестный символ: {symbol}\n"
+            "Доступно: BTC, ETH, SOL, AVAX, DOGE, LINK"
+        )
+        return
+    
+    try:
+        quantity = float(context.args[1])
+        entry_price = float(context.args[2])
+        target_profit = float(context.args[3]) if len(context.args) > 3 else 10.0
+        
+        if quantity <= 0 or entry_price <= 0:
+            raise ValueError()
+    except ValueError:
+        await update.message.reply_text("❌ Количество и цена должны быть положительными числами")
+        return
+    
+    user_id = update.effective_user.id
+    
+    from datetime import datetime
+    trade_data = {
+        "symbol": symbol,
+        "quantity": quantity,
+        "entry_price": entry_price,
+        "target_profit": target_profit,
+        "created_at": datetime.now().isoformat()
+    }
+    
+    async with aiohttp.ClientSession() as session:
+        success = await supabase_add_trade(session, user_id, trade_data)
+    
+    if success:
+        total_value = quantity * entry_price
+        target_price = entry_price * (1 + target_profit / 100)
+        
+        await update.message.reply_text(
+            f"✅ <b>Сделка открыта!</b>\n\n"
+            f"💎 {symbol}\n"
+            f"📊 Количество: {quantity:.4f}\n"
+            f"💵 Цена входа: ${entry_price:,.2f}\n"
+            f"💰 Сумма: ${total_value:,.2f}\n"
+            f"🎯 Цель: +{target_profit}% (${target_price:,.2f})\n\n"
+            f"Бот будет отслеживать прибыль и пришлёт уведомление!",
+            parse_mode='HTML'
+        )
+    else:
+        await update.message.reply_text("❌ Ошибка при сохранении сделки")
+
+async def cmd_trades(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Показать открытые сделки"""
+    user_id = update.effective_user.id
+    
+    async with aiohttp.ClientSession() as session:
+        trades = await supabase_get_trades(session, user_id, "open")
+        
+        if not trades:
+            await update.message.reply_text(
+                "📈 <b>У вас нет открытых сделок</b>\n\n"
+                "Откройте новую сделку:\n"
+                "<code>/trade BTC 0.5 50000</code>",
+                parse_mode='HTML'
+            )
+            return
+        
+        lines = ["📈 <b>Ваши открытые сделки:</b>\n"]
+        total_profit_usd = 0
+        total_profit_pct = 0
+        
+        for trade in trades:
+            symbol = trade['symbol']
+            quantity = trade['quantity']
+            entry_price = trade['entry_price']
+            target_profit = trade['target_profit']
+            trade_id = trade['id']
+            
+            # Получаем текущую цену
+            crypto_data = await get_crypto_price(session, symbol)
+            
+            if crypto_data:
+                current_price = crypto_data["usd"]
+                profit_usd = (current_price - entry_price) * quantity
+                profit_pct = ((current_price - entry_price) / entry_price) * 100
+                total_profit_usd += profit_usd
+                total_profit_pct += profit_pct
+                
+                emoji = "🟢" if profit_pct >= 0 else "🔴"
+                target_emoji = "🎯" if profit_pct >= target_profit else "⏳"
+                
+                lines.append(f"{emoji} <b>{symbol}</b> (ID: {trade_id})")
+                lines.append(f"   Количество: {quantity:.4f}")
+                lines.append(f"   Вход: ${entry_price:,.2f}")
+                lines.append(f"   Сейчас: ${current_price:,.2f}")
+                lines.append(f"   Прибыль: ${profit_usd:,.2f} ({profit_pct:+.2f}%)")
+                lines.append(f"   {target_emoji} Цель: +{target_profit}%\n")
+        
+        if len(trades) > 0:
+            avg_profit = total_profit_pct / len(trades)
+            lines.append(f"<b>💰 Итого прибыль:</b> ${total_profit_usd:,.2f}")
+            lines.append(f"<b>📊 Средняя прибыль:</b> {avg_profit:+.2f}%")
+        
+        await update.message.reply_text("\n".join(lines), parse_mode='HTML')
+
+async def cmd_close_trade(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Закрыть сделку"""
+    if len(context.args) != 1:
+        await update.message.reply_text(
+            "Использование: <code>/close ID</code>\n\n"
+            "Узнать ID: /trades",
+            parse_mode='HTML'
+        )
+        return
+    
+    try:
+        trade_id = int(context.args[0])
+    except ValueError:
+        await update.message.reply_text("❌ ID должен быть числом")
+        return
+    
+    user_id = update.effective_user.id
+    
+    async with aiohttp.ClientSession() as session:
+        # Получаем сделку
+        trades = await supabase_get_trades(session, user_id, "open")
+        trade = next((t for t in trades if t['id'] == trade_id), None)
+        
+        if not trade:
+            await update.message.reply_text(f"❌ Сделка {trade_id} не найдена")
+            return
+        
+        # Получаем текущую цену
+        crypto_data = await get_crypto_price(session, trade['symbol'])
+        
+        if not crypto_data:
+            await update.message.reply_text("❌ Не удалось получить текущую цену")
+            return
+        
+        current_price = crypto_data["usd"]
+        
+        # Закрываем сделку
+        success = await supabase_close_trade(session, trade_id, current_price)
+        
+        if success:
+            profit_usd = (current_price - trade['entry_price']) * trade['quantity']
+            profit_pct = ((current_price - trade['entry_price']) / trade['entry_price']) * 100
+            
+            emoji = "🎉" if profit_pct >= 0 else "😔"
+            
+            await update.message.reply_text(
+                f"{emoji} <b>Сделка закрыта!</b>\n\n"
+                f"💎 {trade['symbol']}\n"
+                f"📊 Количество: {trade['quantity']:.4f}\n"
+                f"📥 Вход: ${trade['entry_price']:,.2f}\n"
+                f"📤 Выход: ${current_price:,.2f}\n"
+                f"💰 Прибыль: ${profit_usd:,.2f} ({profit_pct:+.2f}%)",
+                parse_mode='HTML'
+            )
+        else:
+            await update.message.reply_text("❌ Ошибка при закрытии сделки")
+
+async def cmd_profit(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Статистика прибыли"""
+    user_id = update.effective_user.id
+    
+    async with aiohttp.ClientSession() as session:
+        open_trades = await supabase_get_trades(session, user_id, "open")
+        closed_trades = await supabase_get_trades(session, user_id, "closed")
+        
+        lines = ["💰 <b>Статистика прибыли</b>\n"]
+        
+        # Открытые сделки
+        if open_trades:
+            total_open_profit = 0
+            for trade in open_trades:
+                crypto_data = await get_crypto_price(session, trade['symbol'])
+                if crypto_data:
+                    profit = (crypto_data["usd"] - trade['entry_price']) * trade['quantity']
+                    total_open_profit += profit
+            
+            lines.append(f"📊 <b>Открытые сделки:</b> {len(open_trades)}")
+            lines.append(f"💵 Нереализованная прибыль: ${total_open_profit:,.2f}\n")
+        
+        # Закрытые сделки
+        if closed_trades:
+            total_closed_profit = 0
+            wins = 0
+            losses = 0
+            
+            for trade in closed_trades:
+                profit = (trade['exit_price'] - trade['entry_price']) * trade['quantity']
+                total_closed_profit += profit
+                if profit >= 0:
+                    wins += 1
+                else:
+                    losses += 1
+            
+            winrate = (wins / len(closed_trades)) * 100 if closed_trades else 0
+            
+            lines.append(f"✅ <b>Закрытые сделки:</b> {len(closed_trades)}")
+            lines.append(f"💰 Реализованная прибыль: ${total_closed_profit:,.2f}")
+            lines.append(f"🎯 Винрейт: {winrate:.1f}% ({wins}W / {losses}L)")
+        
+        if not open_trades and not closed_trades:
+            lines.append("У вас пока нет сделок")
+        
+        await update.message.reply_text("\n".join(lines), parse_mode='HTML')
+
+async def cmd_investor_type(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Выбрать тип инвестора"""
+    keyboard = [
+        [InlineKeyboardButton("📅 Долгосрочный", callback_data="investor_long")],
+        [InlineKeyboardButton("📊 Свинг-трейдер", callback_data="investor_swing")],
+        [InlineKeyboardButton("⚡ Дневной трейдер", callback_data="investor_day")],
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    
+    user_id = update.effective_user.id
+    current_type = user_investor_types.get(user_id, "swing")
+    current_name = INVESTOR_TYPES[current_type]["name"]
+    
+    await update.message.reply_text(
+        f"👤 <b>Выберите тип инвестора</b>\n\n"
+        f"Текущий: <b>{current_name}</b>\n\n"
+        f"Это влияет на торговые сигналы и рекомендации.",
+        parse_mode='HTML',
+        reply_markup=reply_markup
+    )
+
+async def cmd_signals(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Получить торговые сигналы"""
+    user_id = update.effective_user.id
+    investor_type = user_investor_types.get(user_id, "swing")
+    investor_config = INVESTOR_TYPES[investor_type]
+    
+    await update.message.reply_text("🔄 Анализирую рынок...")
+    
+    async with aiohttp.ClientSession() as session:
+        fear_greed = await get_fear_greed_index(session) or 50
+        
+        lines = [
+            f"🎯 <b>Торговые сигналы</b>\n",
+            f"👤 Профиль: <b>{investor_config['name']}</b>",
+            f"📊 Индекс рынка: <b>{fear_greed}/100</b>\n"
+        ]
+        
+        for symbol in ["BTC", "ETH", "SOL", "AVAX"]:
+            crypto_data = await get_crypto_price(session, symbol)
+            if not crypto_data:
+                continue
+            
+            price = crypto_data["usd"]
+            change_24h = crypto_data.get("change_24h", 0)
+            
+            # Логика сигналов на основе типа инвестора
+            signal = "🟡 ДЕРЖАТЬ"
+            reason = ""
+            
+            if change_24h <= investor_config["buy_threshold"]:
+                signal = "🟢 ПОКУПАТЬ"
+                reason = f"Падение {change_24h:.1f}% - хорошая точка входа"
+            elif change_24h >= investor_config["sell_threshold"]:
+                signal = "🔴 ПРОДАВАТЬ"
+                reason = f"Рост {change_24h:.1f}% - фиксируйте прибыль"
+            elif fear_greed < 25 and investor_type == "long":
+                signal = "🟢 ПОКУПАТЬ"
+                reason = "Паника на рынке - время покупать"
+            elif fear_greed > 75 and investor_type != "day":
+                signal = "🔴 ПРОДАВАТЬ"
+                reason = "Чрезмерная жадность - осторожно"
+            else:
+                reason = "Стабильная ситуация"
+            
+            lines.append(f"\n<b>{symbol}</b> ${price:,.2f} ({change_24h:+.1f}%)")
+            lines.append(f"{signal}")
+            lines.append(f"💡 {reason}")
+        
+        lines.append(f"\n<i>⚠️ Не является финансовой рекомендацией</i>")
+        
+        await update.message.reply_text("\n".join(lines), parse_mode='HTML')
+
+async def callback_investor_type(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обработка выбора типа инвестора"""
+    query = update.callback_query
+    await query.answer()
+    
+    investor_type = query.data.replace("investor_", "")
+    user_id = update.effective_user.id
+    user_investor_types[user_id] = investor_type
+    
+    config = INVESTOR_TYPES[investor_type]
+    
+    await query.edit_message_text(
+        f"✅ <b>Тип инвестора изменён!</b>\n\n"
+        f"👤 {config['name']}\n"
+        f"🎯 Целевая прибыль: {config['target_profit']}%\n"
+        f"📅 Срок удержания: {config['hold_days']} дней\n"
+        f"📉 Покупка при: {config['buy_threshold']}%\n"
+        f"📈 Продажа при: {config['sell_threshold']}%\n\n"
+        f"Теперь сигналы будут настроены под ваш стиль!",
+        parse_mode='HTML'
+    )
+
+async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Помощь"""
+    message = (
+        "ℹ️ <b>Помощь по боту:</b>\n\n"
         "<b>Кнопки меню:</b>\n"
         "💼 Мой портфель\n"
         "💹 Все цены\n"
@@ -1015,15 +1520,26 @@ async def handle_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await cmd_portfolio(update, context)
     elif text == "💹 Все цены":
         await cmd_all_prices(update, context)
+    elif text == "📈 Мои сделки":
+        await cmd_trades(update, context)
+    elif text == "💰 Добавить сделку":
+        await update.message.reply_text(
+            "💰 <b>Открыть сделку</b>\n\n"
+            "Используйте команду:\n"
+            "<code>/trade SYMBOL КОЛИЧЕСТВО ЦЕНА_ВХОДА</code>\n\n"
+            "<b>Пример:</b>\n"
+            "<code>/trade BTC 0.5 50000</code>",
+            parse_mode='HTML'
+        )
+    elif text == "🎯 Сигналы":
+        await cmd_signals(update, context)
+    elif text == "👤 Тип инвестора":
+        await cmd_investor_type(update, context)
     elif text == "📰 События недели":
         await cmd_events(update, context)
     elif text == "📊 Прогнозы":
         await cmd_forecast(update, context)
-    elif text == "➕ Добавить актив":
-        await cmd_add_asset(update, context)
-    elif text == "➖ Удалить актив":
-        await cmd_remove_asset(update, context)
-    elif text == "⚙️ Настройки алертов":
+    elif text == "⚙️ Настройки":
         await cmd_alerts(update, context)
     elif text == "ℹ️ Помощь":
         await cmd_help(update, context)
@@ -1057,6 +1573,17 @@ def main():
     app.add_handler(CommandHandler("events", cmd_events))
     app.add_handler(CommandHandler("chart", cmd_chart))
     
+    # Trade commands
+    app.add_handler(CommandHandler("trade", cmd_trade))
+    app.add_handler(CommandHandler("trades", cmd_trades))
+    app.add_handler(CommandHandler("close", cmd_close_trade))
+    app.add_handler(CommandHandler("profit", cmd_profit))
+    app.add_handler(CommandHandler("signals", cmd_signals))
+    app.add_handler(CommandHandler("investor", cmd_investor_type))
+    
+    # Callback handlers
+    app.add_handler(CallbackQueryHandler(callback_investor_type, pattern="^investor_"))
+    
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_buttons))
     app.add_error_handler(on_error)
 
@@ -1064,6 +1591,7 @@ def main():
     
     if job_queue and CHAT_ID:
         job_queue.run_repeating(check_price_alerts, interval=600, first=60)
+        job_queue.run_repeating(check_trade_profits, interval=300, first=120)  # Каждые 5 минут
         job_queue.run_daily(daily_report, time=dt_time(hour=11, minute=0), days=(0,1,2,3,4,5,6))
         job_queue.run_daily(weekly_report, time=dt_time(hour=19, minute=0), days=(6,))
         print("🚀 Bot running with monitoring enabled")
