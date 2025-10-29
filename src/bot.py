@@ -150,13 +150,17 @@ def save_portfolio(user_id: int, portfolio: Dict[str, float]):
 async def check_price_alerts(context: ContextTypes.DEFAULT_TYPE):
     """Проверка цен каждые 10 минут"""
     if not CHAT_ID:
+        print("⚠️ CHAT_ID not set, skipping alerts")
         return
+    
+    print("🔔 Running price alerts check...")
     
     try:
         async with aiohttp.ClientSession() as session:
             alerts = []
             
             # Проверяем акции/ETF
+            print("📊 Checking stocks/ETF...")
             for ticker in AVAILABLE_TICKERS:
                 price_data = await get_yahoo_price(session, ticker)
                 if not price_data:
@@ -168,6 +172,7 @@ async def check_price_alerts(context: ContextTypes.DEFAULT_TYPE):
                 if cache_key in last_prices:
                     old_price = last_prices[cache_key]
                     change_pct = ((price - old_price) / old_price) * 100
+                    print(f"  {ticker}: {old_price:.2f} -> {price:.2f} ({change_pct:+.2f}%)")
                     
                     if abs(change_pct) >= THRESHOLDS["stocks"]:
                         name = AVAILABLE_TICKERS[ticker]["name"]
@@ -176,11 +181,15 @@ async def check_price_alerts(context: ContextTypes.DEFAULT_TYPE):
                             f"{emoji} <b>{name}</b>: {change_pct:+.2f}%\n"
                             f"Цена: {price:.2f} {currency}"
                         )
+                        print(f"  🚨 ALERT! {name} changed by {change_pct:+.2f}%")
+                else:
+                    print(f"  {ticker}: First check, storing price {price:.2f}")
                 
                 last_prices[cache_key] = price
                 await asyncio.sleep(0.3)
             
             # Проверяем криптовалюты
+            print("₿ Checking crypto...")
             for symbol in CRYPTO_IDS:
                 crypto_data = await get_crypto_price(session, symbol)
                 if not crypto_data:
@@ -192,6 +201,7 @@ async def check_price_alerts(context: ContextTypes.DEFAULT_TYPE):
                 if cache_key in last_prices:
                     old_price = last_prices[cache_key]
                     change_pct = ((price - old_price) / old_price) * 100
+                    print(f"  {symbol}: ${old_price:,.2f} -> ${price:,.2f} ({change_pct:+.2f}%)")
                     
                     if abs(change_pct) >= THRESHOLDS["crypto"]:
                         emoji = "🚀" if change_pct > 0 else "⚠️"
@@ -199,16 +209,23 @@ async def check_price_alerts(context: ContextTypes.DEFAULT_TYPE):
                             f"{emoji} <b>{symbol}</b>: {change_pct:+.2f}%\n"
                             f"Цена: ${price:,.2f}"
                         )
+                        print(f"  🚨 ALERT! {symbol} changed by {change_pct:+.2f}%")
+                else:
+                    print(f"  {symbol}: First check, storing price ${price:,.2f}")
                 
                 last_prices[cache_key] = price
                 await asyncio.sleep(0.2)
             
+            print(f"✅ Alert check complete. Cached prices: {len(last_prices)}, Alerts: {len(alerts)}")
+            
             if alerts:
                 message = "🔔 <b>Ценовые алерты!</b>\n\n" + "\n\n".join(alerts)
                 await context.bot.send_message(chat_id=CHAT_ID, text=message, parse_mode='HTML')
+                print("📤 Alerts sent to user")
     
     except Exception as e:
         print(f"❌ check_price_alerts error: {e}")
+        traceback.print_exc()
 
 async def daily_report(context: ContextTypes.DEFAULT_TYPE):
     """Ежедневный отчёт"""
@@ -467,9 +484,53 @@ async def cmd_alerts(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "• Проверка: каждые 10 минут\n"
         "• Утренний отчёт: 11:00 (Рига)\n"
         "• Недельный отчёт: Вс 19:00 (Рига)\n\n"
-        "Изменить: <code>/setalert stocks 2</code>"
+        f"💾 В кэше: {len(last_prices)} цен\n\n"
+        "Изменить: <code>/setalert stocks 2</code>\n"
+        "Тест: <code>/testalert</code>"
     )
     await update.message.reply_text(message, parse_mode='HTML')
+
+async def cmd_test_alert(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Тестовая проверка алертов"""
+    await update.message.reply_text("🔄 Запускаю проверку алертов...")
+    await check_price_alerts(context)
+    await update.message.reply_text(
+        f"✅ Проверка завершена!\n"
+        f"💾 В кэше: {len(last_prices)} цен\n\n"
+        f"Смотрите логи Render для деталей."
+    )
+
+async def cmd_setalert(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Изменить пороги алертов"""
+    if not context.args or len(context.args) != 2:
+        await update.message.reply_text(
+            "Использование: <code>/setalert [stocks|crypto] [процент]</code>\n\n"
+            "Примеры:\n"
+            "<code>/setalert stocks 2</code> — алерты для акций при ±2%\n"
+            "<code>/setalert crypto 5</code> — алерты для крипты при ±5%",
+            parse_mode='HTML'
+        )
+        return
+    
+    asset_type = context.args[0].lower()
+    try:
+        threshold = float(context.args[1])
+        if threshold <= 0:
+            raise ValueError()
+    except ValueError:
+        await update.message.reply_text("❌ Процент должен быть положительным числом")
+        return
+    
+    if asset_type not in ["stocks", "crypto"]:
+        await update.message.reply_text("❌ Тип должен быть 'stocks' или 'crypto'")
+        return
+    
+    THRESHOLDS[asset_type] = threshold
+    name = "акций/ETF" if asset_type == "stocks" else "криптовалют"
+    await update.message.reply_text(
+        f"✅ Порог алертов для {name} установлен: ±{threshold}%",
+        parse_mode='HTML'
+    )
 
 async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Помощь"""
@@ -536,6 +597,8 @@ def main():
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("add", cmd_add))
     app.add_handler(CommandHandler("remove", cmd_remove))
+    app.add_handler(CommandHandler("setalert", cmd_setalert))
+    app.add_handler(CommandHandler("testalert", cmd_test_alert))
     
     # Обработка кнопок
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_buttons))
