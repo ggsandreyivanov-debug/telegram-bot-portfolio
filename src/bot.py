@@ -36,7 +36,7 @@ TIMEOUT = aiohttp.ClientTimeout(total=15)
 AVAILABLE_TICKERS = {
     "VWCE.DE": {"name": "VWCE", "type": "stock"},
     "4GLD.DE": {"name": "4GLD (Gold ETC)", "type": "stock"},
-    "EWG2.DE": {"name": "X IE Physical Gold ETC", "type": "stock"},
+    "DE000A2T5DZ1.SG": {"name": "X IE Physical Gold ETC", "type": "stock"},
     "SPY": {"name": "S&P 500 (SPY)", "type": "stock"},
 }
 
@@ -135,7 +135,7 @@ def get_user_portfolio(user_id: int) -> Dict[str, float]:
         # Дефолтный портфель
         user_portfolios[user_id] = {
             "VWCE.DE": 0,
-            "EWG2.DE": 0,
+            "DE000A2T5DZ1.SG": 0,
             "BTC": 0,
             "ETH": 0,
             "SOL": 0,
@@ -377,7 +377,7 @@ async def cmd_add_asset(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "<code>/add BTC 0.5</code> - 0.5 BTC\n"
         "<code>/add ETH 2</code> - 2 ETH\n\n"
         "<b>Доступные тикеры:</b>\n"
-        "• VWCE.DE, 4GLD.DE, EWG2.DE, SPY\n"
+        "• VWCE.DE, 4GLD.DE, DE000A2T5DZ1.SG, SPY\n"
         "• BTC, ETH, SOL, AVAX, DOGE, LINK",
         parse_mode='HTML'
     )
@@ -405,7 +405,7 @@ async def cmd_add(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if ticker not in AVAILABLE_TICKERS and ticker not in CRYPTO_IDS:
         await update.message.reply_text(
             f"❌ Неизвестный тикер: {ticker}\n\n"
-            "Доступные тикеры: VWCE.DE, 4GLD.DE, EWG2.DE, SPY, BTC, ETH, SOL, AVAX, DOGE, LINK"
+            "Доступные тикеры: VWCE.DE, 4GLD.DE, DE000A2T5DZ1.SG, SPY, BTC, ETH, SOL, AVAX, DOGE, LINK"
         )
         return
     
@@ -511,7 +511,26 @@ async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE):
     traceback.print_exc()
 
 def main():
-    app = Application.builder().token(TOKEN).build()
+    # Обходной путь для python-telegram-bot 20.6 + Python 3.13
+    from telegram.ext import ApplicationBuilder
+    
+    # Создаём приложение без автоматического создания Updater
+    builder = ApplicationBuilder()
+    builder.token(TOKEN)
+    
+    # Отключаем автоматическое создание updater для избежания ошибки
+    try:
+        app = builder.build()
+    except AttributeError:
+        # Fallback для старых версий
+        import telegram.ext._applicationbuilder as ab
+        # Патчим build метод
+        original_build = ab.ApplicationBuilder.build
+        def patched_build(self):
+            self._updater = None  # Отключаем updater
+            return original_build(self)
+        ab.ApplicationBuilder.build = patched_build
+        app = builder.build()
 
     # Команды
     app.add_handler(CommandHandler("start", cmd_start))
@@ -533,7 +552,9 @@ def main():
     else:
         print("🚀 Bot running (monitoring disabled)")
     
-    app.run_polling()
+    # Запускаем polling вручную
+    print("🔄 Starting polling...")
+    app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 if __name__ == "__main__":
     main()
