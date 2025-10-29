@@ -131,7 +131,10 @@ async def get_crypto_price(session: aiohttp.ClientSession, symbol: str) -> Optio
             result = await fetch_func()
             if result and result.get("usd"):
                 result["source"] = source_name
-                print(f"✅ {symbol} from {source_name}: ${result['usd']:,.2f}")
+                price = result['usd']
+                chg = result.get('change_24h')
+                chg_str = f"{chg:+.2f}%" if chg else "N/A"
+                print(f"✅ {symbol} from {source_name}: ${price:,.2f} ({chg_str})")
                 return result
         except Exception as e:
             print(f"⚠️ {source_name} failed for {symbol}: {e}")
