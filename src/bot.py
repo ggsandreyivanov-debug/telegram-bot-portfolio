@@ -257,25 +257,39 @@ async def calculate_probability(session: aiohttp.ClientSession, symbol: str, eve
     
     probability = max(20, min(80, probability))  # Ограничиваем 20-80%
     
-    # Определяем прогноз
-    if probability >= 60:
+    # Определяем прогноз и рекомендацию
+    if probability >= 65:
         prediction = f"📈 Рост вероятен"
-        price_change = f"+{(probability - 50) * 0.15:.1f}%"
+        price_change = f"+{2 + (probability - 65) * 0.2:.1f}%"
         confidence = "высокая"
-    elif probability <= 40:
-        prediction = f"📉 Падение вероятно"
-        price_change = f"-{(50 - probability) * 0.15:.1f}%"
-        confidence = "высокая"
-    else:
-        prediction = f"📊 Нейтрально"
-        price_change = "±1-2%"
+        recommendation = "🟢 ПОКУПАТЬ"
+    elif probability >= 55:
+        prediction = f"📈 Небольшой рост"
+        price_change = f"+{0.5 + (probability - 55) * 0.15:.1f}%"
         confidence = "средняя"
+        recommendation = "🟡 ДЕРЖАТЬ"
+    elif probability >= 45:
+        prediction = f"📊 Нейтрально"
+        price_change = "±0.5-1.5%"
+        confidence = "низкая"
+        recommendation = "🟡 ВОЗДЕРЖАТЬСЯ"
+    elif probability >= 35:
+        prediction = f"📉 Небольшое падение"
+        price_change = f"-{0.5 + (45 - probability) * 0.15:.1f}%"
+        confidence = "средняя"
+        recommendation = "🟡 ДЕРЖАТЬ"
+    else:
+        prediction = f"📉 Падение вероятно"
+        price_change = f"-{2 + (35 - probability) * 0.2:.1f}%"
+        confidence = "высокая"
+        recommendation = "🔴 ПРОДАВАТЬ"
     
     return {
         "probability": probability,
         "prediction": prediction,
         "price_change": price_change,
         "confidence": confidence,
+        "recommendation": recommendation,
         "factors": {
             "fear_greed": fear_greed,
             "sentiment": sentiment_data["overall"],
@@ -804,24 +818,30 @@ async def cmd_all_prices(update: Update, context: ContextTypes.DEFAULT_TYPE):
             lines.append("─" * 40)
             
             for symbol, info in CRYPTO_IDS.items():
-                crypto_data = await get_crypto_price(session, symbol)
-                if crypto_data:
-                    price = crypto_data["usd"]
-                    chg = crypto_data.get("change_24h")
-                    
-                    sym_str = symbol.ljust(8)
-                    price_str = f"${price:,.2f}".rjust(15)
-                    
-                    if chg:
-                        chg_emoji = "📈" if chg >= 0 else "📉"
-                        chg_str = f"{chg_emoji} {chg:+.2f}%"
-                        lines.append(f"{sym_str} {price_str}  {chg_str}")
+                try:
+                    crypto_data = await get_crypto_price(session, symbol)
+                    if crypto_data:
+                        price = crypto_data["usd"]
+                        chg = crypto_data.get("change_24h")
+                        
+                        sym_str = symbol.ljust(8)
+                        price_str = f"${price:,.2f}".rjust(15)
+                        
+                        if chg and not math.isnan(chg):
+                            chg_emoji = "📈" if chg >= 0 else "📉"
+                            chg_str = f"{chg_emoji} {chg:+.2f}%"
+                            lines.append(f"{sym_str} {price_str}  {chg_str}")
+                        else:
+                            lines.append(f"{sym_str} {price_str}")
                     else:
-                        lines.append(f"{sym_str} {price_str}")
-                else:
+                        sym_str = symbol.ljust(8)
+                        lines.append(f"{sym_str} {'н/д'.rjust(15)}")
+                except Exception as e:
+                    print(f"❌ {symbol} price error: {e}")
                     sym_str = symbol.ljust(8)
-                    lines.append(f"{sym_str} {'н/д'.rjust(15)}")
-                await asyncio.sleep(0.2)
+                    lines.append(f"{sym_str} {'ошибка'.rjust(15)}")
+                
+                await asyncio.sleep(0.3)
             
             lines.append("</pre>")
         
@@ -1048,15 +1068,17 @@ async def cmd_events(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     prob = event.get("probability", 50)
                     price_change = event.get("price_change", "")
                     confidence = event.get("confidence", "средняя")
+                    recommendation = event.get("recommendation", "🟡 ДЕРЖАТЬ")
                     
                     lines.append(f"\n📅 <b>{date}</b> | {asset}")
                     lines.append(f"📌 {title}")
                     lines.append(f"🎯 Влияние: {impact}")
                     lines.append(f"💡 Прогноз: {pred}")
-                    lines.append(f"📊 Ожидаемое изменение: {price_change}")
-                    lines.append(f"🔮 Уверенность прогноза: {confidence} ({prob:.0f}/100)")
+                    lines.append(f"📊 Изменение: {price_change}")
+                    lines.append(f"💰 Рекомендация: <b>{recommendation}</b>")
+                    lines.append(f"🔮 Уверенность: {confidence} ({prob:.0f}/100)")
                     lines.append("")
-                    lines.append(f"<i>Факторы: рыночный сентимент, тренд 7д, соц.активность</i>")
+                    lines.append(f"<i>Анализ: рынок, тренд, соц.сети</i>")
             
             if not stock_events and not crypto_events:
                 lines.append("<i>Нет важных событий на эту неделю</i>")
