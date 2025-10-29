@@ -297,8 +297,12 @@ async def cmd_portfolio(update: Update, context: ContextTypes.DEFAULT_TYPE):
         async with aiohttp.ClientSession() as session:
             # Акции/ETF
             stock_items = [(k, v) for k, v in portfolio.items() if k in AVAILABLE_TICKERS]
-            if stock_items:
+            if stock_items and any(v > 0 for k, v in stock_items):
                 lines.append("<b>📊 Акции/ETF:</b>")
+                lines.append("<pre>")
+                lines.append("Актив          Кол-во    Цена        Сумма")
+                lines.append("─" * 50)
+                
                 for ticker, quantity in stock_items:
                     if quantity == 0:
                         continue
@@ -306,20 +310,30 @@ async def cmd_portfolio(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     if price_data:
                         price, cur = price_data
                         value = price * quantity
-                        lines.append(
-                            f"• {AVAILABLE_TICKERS[ticker]['name']}: {quantity:.2f} шт\n"
-                            f"  Цена: {price:.2f} {cur} | Сумма: {value:.2f} {cur}"
-                        )
+                        
+                        name = AVAILABLE_TICKERS[ticker]['name'][:14].ljust(14)
+                        qty_str = f"{quantity:.2f}".rjust(8)
+                        price_str = f"{price:.2f}".rjust(8)
+                        value_str = f"{value:.2f} {cur}".rjust(12)
+                        
+                        lines.append(f"{name} {qty_str} {price_str} {value_str}")
+                        
                         if cur == "USD":
                             total_value_usd += value
                         elif cur == "EUR":
-                            total_value_usd += value * 1.1  # Примерный курс
+                            total_value_usd += value * 1.1
                     await asyncio.sleep(0.3)
+                
+                lines.append("</pre>")
             
             # Криптовалюты
             crypto_items = [(k, v) for k, v in portfolio.items() if k in CRYPTO_IDS]
-            if crypto_items:
+            if crypto_items and any(v > 0 for k, v in crypto_items):
                 lines.append("\n<b>₿ Криптовалюты:</b>")
+                lines.append("<pre>")
+                lines.append("Монета    Кол-во      Цена          Сумма")
+                lines.append("─" * 50)
+                
                 for symbol, quantity in crypto_items:
                     if quantity == 0:
                         continue
@@ -330,12 +344,16 @@ async def cmd_portfolio(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         value = price * quantity
                         total_value_usd += value
                         
-                        chg_str = f" ({chg:+.2f}%)" if chg else ""
-                        lines.append(
-                            f"• {symbol}: {quantity:.4f}\n"
-                            f"  Цена: ${price:,.2f}{chg_str} | Сумма: ${value:,.2f}"
-                        )
+                        sym_str = symbol.ljust(9)
+                        qty_str = f"{quantity:.4f}".rjust(10)
+                        price_str = f"${price:,.2f}".rjust(12)
+                        value_str = f"${value:,.2f}".rjust(12)
+                        
+                        chg_emoji = "📈" if chg and chg >= 0 else "📉" if chg else ""
+                        lines.append(f"{sym_str} {qty_str} {price_str} {value_str} {chg_emoji}")
                     await asyncio.sleep(0.2)
+                
+                lines.append("</pre>")
         
         if total_value_usd > 0:
             lines.append(f"\n<b>💰 Общая стоимость: ~${total_value_usd:,.2f}</b>")
@@ -353,34 +371,59 @@ async def cmd_all_prices(update: Update, context: ContextTypes.DEFAULT_TYPE):
         lines = ["💹 <b>Все цены:</b>\n"]
         
         async with aiohttp.ClientSession() as session:
+            # Акции/ETF в виде таблицы
             lines.append("<b>📊 Фондовый рынок:</b>")
+            lines.append("<pre>")
+            lines.append("Актив                Цена")
+            lines.append("─" * 35)
+            
             for ticker, info in AVAILABLE_TICKERS.items():
                 price_data = await get_yahoo_price(session, ticker)
                 if price_data:
                     price, cur = price_data
-                    lines.append(f"• {info['name']}: {price:.2f} {cur}")
+                    name = info['name'][:20].ljust(20)
+                    price_str = f"{price:.2f} {cur}".rjust(12)
+                    lines.append(f"{name} {price_str}")
                 else:
-                    lines.append(f"• {info['name']}: н/д")
+                    name = info['name'][:20].ljust(20)
+                    lines.append(f"{name} {'н/д'.rjust(12)}")
                 await asyncio.sleep(0.3)
             
+            lines.append("</pre>")
+            
+            # Криптовалюты в виде таблицы
             lines.append("\n<b>₿ Криптовалюты:</b>")
+            lines.append("<pre>")
+            lines.append("Монета   Цена            Изменение")
+            lines.append("─" * 40)
+            
             for symbol, info in CRYPTO_IDS.items():
                 crypto_data = await get_crypto_price(session, symbol)
                 if crypto_data:
                     price = crypto_data["usd"]
                     chg = crypto_data.get("change_24h")
+                    
+                    sym_str = symbol.ljust(8)
+                    price_str = f"${price:,.2f}".rjust(15)
+                    
                     if chg:
-                        lines.append(f"• {symbol}: ${price:,.2f} ({chg:+.2f}%)")
+                        chg_emoji = "📈" if chg >= 0 else "📉"
+                        chg_str = f"{chg_emoji} {chg:+.2f}%"
+                        lines.append(f"{sym_str} {price_str}  {chg_str}")
                     else:
-                        lines.append(f"• {symbol}: ${price:,.2f}")
+                        lines.append(f"{sym_str} {price_str}")
                 else:
-                    lines.append(f"• {symbol}: н/д")
+                    sym_str = symbol.ljust(8)
+                    lines.append(f"{sym_str} {'н/д'.rjust(15)}")
                 await asyncio.sleep(0.2)
+            
+            lines.append("</pre>")
         
         await update.message.reply_text("\n".join(lines), parse_mode='HTML')
     
     except Exception as e:
         print(f"❌ all_prices error: {e}")
+        traceback.print_exc()
         await update.message.reply_text("⚠ Ошибка при получении данных")
 
 async def cmd_add_asset(update: Update, context: ContextTypes.DEFAULT_TYPE):
