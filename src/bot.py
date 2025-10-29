@@ -939,41 +939,56 @@ async def cmd_all_prices(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Показать все доступные цены"""
     try:
         from datetime import datetime
-        now = datetime.now().strftime("%H:%M:%S %d.%m.%Y")
+        import pytz
         
-        lines = [f"💹 <b>Все цены</b> (обновлено {now})\n"]
+        # Время получения данных (Рига)
+        riga_tz = pytz.timezone('Europe/Riga')
+        now = datetime.now(riga_tz)
+        timestamp = now.strftime("%H:%M:%S %d.%m.%Y")
+        
+        lines = [
+            f"💹 <b>Все цены</b>\n",
+            f"🕐 Данные актуальны на: <b>{timestamp}</b> (Рига)\n"
+        ]
         
         async with aiohttp.ClientSession() as session:
             # Акции/ETF в виде таблицы
             lines.append("<b>📊 Фондовый рынок:</b>")
             lines.append("<pre>")
-            lines.append("┌─────────────────────┬──────────────┐")
-            lines.append("│ Актив               │ Цена         │")
-            lines.append("├─────────────────────┼──────────────┤")
+            lines.append("┌──────────────────┬────────────┬─────────┐")
+            lines.append("│ Актив            │ Цена       │ 24h     │")
+            lines.append("├──────────────────┼────────────┼─────────┤")
             
             stock_source = "Yahoo Finance"
             for ticker, info in AVAILABLE_TICKERS.items():
                 price_data = await get_yahoo_price(session, ticker)
                 if price_data:
-                    price, cur = price_data
-                    name = info['name'][:19].ljust(19)
-                    price_str = f"{price:.2f} {cur}".rjust(12)
-                    lines.append(f"│ {name} │ {price_str} │")
+                    price, cur, change_pct = price_data
+                    name = info['name'][:16].ljust(16)
+                    price_str = f"{price:.2f} {cur}".ljust(10)
+                    
+                    if change_pct != 0:
+                        chg_emoji = "↗" if change_pct >= 0 else "↘"
+                        chg_str = f"{chg_emoji}{abs(change_pct):.1f}%".rjust(7)
+                    else:
+                        chg_str = "0.0%".rjust(7)
+                    
+                    lines.append(f"│ {name} │ {price_str} │ {chg_str} │")
                 else:
-                    name = info['name'][:19].ljust(19)
-                    lines.append(f"│ {name} │ {'н/д'.rjust(12)} │")
+                    name = info['name'][:16].ljust(16)
+                    lines.append(f"│ {name} │ {'н/д'.ljust(10)} │ {'N/A'.rjust(7)} │")
                 await asyncio.sleep(0.3)
             
-            lines.append("└─────────────────────┴──────────────┘")
+            lines.append("└──────────────────┴────────────┴─────────┘")
             lines.append(f"Источник: {stock_source}")
             lines.append("</pre>")
             
             # Криптовалюты в виде таблицы
             lines.append("\n<b>₿ Криптовалюты:</b>")
             lines.append("<pre>")
-            lines.append("┌────────┬───────────────┬────────────┐")
-            lines.append("│ Монета │ Цена          │ 24h        │")
-            lines.append("├────────┼───────────────┼────────────┤")
+            lines.append("┌────────┬──────────────┬─────────┐")
+            lines.append("│ Монета │ Цена         │ 24h     │")
+            lines.append("├────────┼──────────────┼─────────┤")
             
             crypto_sources = {}
             for symbol, info in CRYPTO_IDS.items():
@@ -987,26 +1002,26 @@ async def cmd_all_prices(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         crypto_sources[symbol] = source
                         
                         sym_str = symbol.ljust(6)
-                        price_str = f"${price:,.2f}".rjust(13)
+                        price_str = f"${price:,.2f}".ljust(12)
                         
                         if chg and not math.isnan(chg):
                             chg_emoji = "↗" if chg >= 0 else "↘"
-                            chg_str = f"{chg_emoji}{abs(chg):.1f}%".rjust(9)
+                            chg_str = f"{chg_emoji}{abs(chg):.1f}%".rjust(7)
                         else:
-                            chg_str = "N/A".rjust(9)
+                            chg_str = "N/A".rjust(7)
                         
                         lines.append(f"│ {sym_str} │ {price_str} │ {chg_str} │")
                     else:
                         sym_str = symbol.ljust(6)
-                        lines.append(f"│ {sym_str} │ {'н/д'.rjust(13)} │ {'N/A'.rjust(9)} │")
+                        lines.append(f"│ {sym_str} │ {'н/д'.ljust(12)} │ {'N/A'.rjust(7)} │")
                 except Exception as e:
                     print(f"❌ {symbol} price error: {e}")
                     sym_str = symbol.ljust(6)
-                    lines.append(f"│ {sym_str} │ {'ошибка'.rjust(13)} │ {'N/A'.rjust(9)} │")
+                    lines.append(f"│ {sym_str} │ {'ошибка'.ljust(12)} │ {'N/A'.rjust(7)} │")
                 
                 await asyncio.sleep(0.3)
             
-            lines.append("└────────┴───────────────┴────────────┘")
+            lines.append("└────────┴──────────────┴─────────┘")
             
             # Показываем источники для крипты
             if crypto_sources:
