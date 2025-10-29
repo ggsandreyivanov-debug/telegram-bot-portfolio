@@ -658,9 +658,13 @@ def main():
     else:
         print("🚀 Bot running (monitoring disabled)")
     
-    # Запускаем polling вручную
+    # Запускаем polling с drop_pending_updates=True для избежания конфликтов
     print("🔄 Starting polling...")
-    app.run_polling(allowed_updates=Update.ALL_TYPES)
+    try:
+        app.run_polling(allowed_updates=Update.ALL_TYPES, drop_pending_updates=True)
+    except Exception as e:
+        print(f"❌ Polling error: {e}")
+        traceback.print_exc()
 
 if __name__ == "__main__":
     main()
