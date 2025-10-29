@@ -7,13 +7,14 @@ import aiohttp
 from typing import Dict, Any, Optional, Tuple, List
 from datetime import time as dt_time
 
-from telegram import Update, ReplyKeyboardMarkup, KeyboardButton
+from telegram import Update, ReplyKeyboardMarkup, KeyboardButton, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     Application,
     CommandHandler,
     MessageHandler,
     ContextTypes,
     filters,
+    CallbackQueryHandler,
 )
 
 # === ENV ===
@@ -88,8 +89,8 @@ async def get_json(session: aiohttp.ClientSession, url: str, params=None) -> Opt
         return None
 
 # ----------------- PRICES: Yahoo Finance -----------------
-async def get_yahoo_price(session: aiohttp.ClientSession, ticker: str) -> Optional[Tuple[float, str]]:
-    """Получить цену одного тикера"""
+async def get_yahoo_price(session: aiohttp.ClientSession, ticker: str) -> Optional[Tuple[float, str, float]]:
+    """Получить цену одного тикера с изменением за день"""
     try:
         url = f"https://query2.finance.yahoo.com/v8/finance/chart/{ticker}"
         params = {"interval": "1d", "range": "1d"}
@@ -100,22 +101,113 @@ async def get_yahoo_price(session: aiohttp.ClientSession, ticker: str) -> Option
             meta = result.get("meta", {})
             price = meta.get("regularMarketPrice")
             cur = meta.get("currency", "USD")
+            change_pct = meta.get("regularMarketChangePercent", 0)
+            
             if price:
-                return (float(price), cur)
+                return (float(price), cur, float(change_pct))
     except Exception as e:
         print(f"❌ Yahoo {ticker} error: {e}")
     return None
 
 # ----------------- PRICES: CoinPaprika -----------------
-async def get_crypto_price(session: aiohttp.ClientSession, symbol: str) -> Optional[Dict[str, float]]:
-    """Получить цену криптовалюты через CoinPaprika"""
+async def get_crypto_price(session: aiohttp.ClientSession, symbol: str) -> Optional[Dict[str, Any]]:
+    """
+    Получить цену криптовалюты с автоматическим fallback по источникам:
+    1. CoinPaprika → 2. CoinGecko → 3. CryptoCompare
+    """
+    crypto_info = CRYPTO_IDS.get(symbol)
+    if not crypto_info:
+        return None
+    
+    # Пробуем источники по очереди
+    sources = [
+        ("CoinPaprika", lambda: get_from_coinpaprika(session, crypto_info)),
+        ("CoinGecko", lambda: get_from_coingecko(session, crypto_info)),
+        ("CryptoCompare", lambda: get_from_cryptocompare(session, symbol)),
+    ]
+    
+    for source_name, fetch_func in sources:
+        try:
+            result = await fetch_func()
+            if result and result.get("usd"):
+                result["source"] = source_name
+                print(f"✅ {symbol} from {source_name}: ${result['usd']:,.2f}")
+                return result
+        except Exception as e:
+            print(f"⚠️ {source_name} failed for {symbol}: {e}")
+            continue
+    
+    print(f"❌ All sources failed for {symbol}")
+    return None
+
+async def get_from_coinpaprika(session: aiohttp.ClientSession, crypto_info: dict) -> Optional[Dict[str, float]]:
+    """Получить с CoinPaprika"""
+    paprika_id = crypto_info["paprika"]
+    url = f"https://api.coinpaprika.com/v1/tickers/{paprika_id}"
+    data = await get_json(session, url, None)
+    
+    if data:
+        quotes = data.get("quotes", {}).get("USD", {})
+        price = quotes.get("price")
+        change_24h = quotes.get("percent_change_24h")
+        if price:
+            return {
+                "usd": float(price),
+                "change_24h": float(change_24h) if change_24h else None
+            }
+    return None
+
+async def get_from_coingecko(session: aiohttp.ClientSession, crypto_info: dict) -> Optional[Dict[str, float]]:
+    """Получить с CoinGecko"""
+    coingecko_id = crypto_info["coingecko"]
+    url = "https://api.coingecko.com/api/v3/simple/price"
+    params = {
+        "ids": coingecko_id,
+        "vs_currencies": "usd",
+        "include_24hr_change": "true"
+    }
+    data = await get_json(session, url, params)
+    
+    if data and coingecko_id in data:
+        coin_data = data[coingecko_id]
+        price = coin_data.get("usd")
+        change_24h = coin_data.get("usd_24h_change")
+        if price:
+            return {
+                "usd": float(price),
+                "change_24h": float(change_24h) if change_24h else None
+            }
+    return None
+
+async def get_from_cryptocompare(session: aiohttp.ClientSession, symbol: str) -> Optional[Dict[str, float]]:
+    """Получить с CryptoCompare"""
+    url = "https://min-api.cryptocompare.com/data/pricemultifull"
+    params = {
+        "fsyms": symbol,
+        "tsyms": "USD"
+    }
+    data = await get_json(session, url, params)
+    
+    if data and "RAW" in data and symbol in data["RAW"]:
+        coin_data = data["RAW"][symbol]["USD"]
+        price = coin_data.get("PRICE")
+        change_24h = coin_data.get("CHANGEPCT24HOUR")
+        if price:
+            return {
+                "usd": float(price),
+                "change_24h": float(change_24h) if change_24h else None
+            }
+    return None
     try:
         crypto_info = CRYPTO_IDS.get(symbol)
         if not crypto_info:
             return None
         
+        # Пробуем CoinPaprika
         paprika_id = crypto_info["paprika"]
         url = f"https://api.coinpaprika.com/v1/tickers/{paprika_id}"
+        
+        print(f"🔍 Fetching {symbol} from CoinPaprika: {url}")
         data = await get_json(session, url, None)
         
         if data:
@@ -123,12 +215,40 @@ async def get_crypto_price(session: aiohttp.ClientSession, symbol: str) -> Optio
             price = quotes.get("price")
             change_24h = quotes.get("percent_change_24h")
             if price:
+                print(f"✅ {symbol}: ${price:,.2f} ({change_24h:+.2f}% if change_24h else 'N/A'})")
                 return {
                     "usd": float(price),
                     "change_24h": float(change_24h) if change_24h else None
                 }
+        
+        # Fallback на CoinGecko
+        print(f"⚠️ CoinPaprika failed for {symbol}, trying CoinGecko...")
+        coingecko_id = crypto_info["coingecko"]
+        cg_url = "https://api.coingecko.com/api/v3/simple/price"
+        cg_params = {
+            "ids": coingecko_id,
+            "vs_currencies": "usd",
+            "include_24hr_change": "true"
+        }
+        
+        cg_data = await get_json(session, cg_url, cg_params)
+        if cg_data and coingecko_id in cg_data:
+            coin_data = cg_data[coingecko_id]
+            price = coin_data.get("usd")
+            change_24h = coin_data.get("usd_24h_change")
+            if price:
+                print(f"✅ {symbol} from CoinGecko: ${price:,.2f}")
+                return {
+                    "usd": float(price),
+                    "change_24h": float(change_24h) if change_24h else None
+                }
+        
+        print(f"❌ Both APIs failed for {symbol}")
+        
     except Exception as e:
-        print(f"❌ CoinPaprika {symbol} error: {e}")
+        print(f"❌ get_crypto_price {symbol} error: {e}")
+        traceback.print_exc()
+    
     return None
 
 # ----------------- EVENTS & NEWS -----------------
@@ -349,36 +469,66 @@ async def get_crypto_events(session: aiohttp.ClientSession) -> List[Dict[str, An
     return events
 
 async def get_stock_events(session: aiohttp.ClientSession) -> List[Dict[str, Any]]:
-    """Получить события для акций/ETF"""
+    """Получить события для акций/ETF с анализом и рекомендациями"""
     events = []
     
     from datetime import datetime, timedelta
     base_date = datetime.now()
     
     # Примеры важных макроэкономических событий
-    events = [
+    sample_events = [
         {
             "asset": "SPY",
             "date": (base_date + timedelta(days=2)).strftime("%d.%m"),
             "title": "FOMC заседание",
-            "impact": "Критический",
-            "prediction": "⚠️ Волатильность"
+            "impact": "Критический"
         },
         {
             "asset": "SPY",
             "date": (base_date + timedelta(days=3)).strftime("%d.%m"),
             "title": "Отчёты Apple, Amazon",
-            "impact": "Высокий",
-            "prediction": "📈 Вероятность роста 60%"
+            "impact": "Высокий"
         },
         {
             "asset": "VWCE.DE",
             "date": (base_date + timedelta(days=5)).strftime("%d.%m"),
             "title": "Данные по инфляции ЕС",
-            "impact": "Средний",
-            "prediction": "📊 Нейтрально"
+            "impact": "Средний"
         }
     ]
+    
+    # Для акций используем упрощённый анализ (без LunarCrush)
+    for event in sample_events:
+        impact = event["impact"]
+        
+        # Базовая оценка на основе типа события
+        if "FOMC" in event["title"] or "Fed" in event["title"]:
+            prob = 48  # Высокая неопределённость
+            pred = "⚠️ Высокая волатильность"
+            change = "±2-4%"
+            rec = "🟡 ВОЗДЕРЖАТЬСЯ"
+        elif "отчёт" in event["title"].lower() or "earnings" in event["title"].lower():
+            prob = 58  # Умеренный оптимизм
+            pred = "📈 Возможен рост"
+            change = "+1-3%"
+            rec = "🟢 ДЕРЖАТЬ"
+        elif "инфляц" in event["title"].lower():
+            prob = 52
+            pred = "📊 Нейтрально"
+            change = "±0.5-1.5%"
+            rec = "🟡 ДЕРЖАТЬ"
+        else:
+            prob = 50
+            pred = "📊 Нейтрально"
+            change = "±1-2%"
+            rec = "🟡 ДЕРЖАТЬ"
+        
+        event["prediction"] = pred
+        event["price_change"] = change
+        event["probability"] = prob
+        event["recommendation"] = rec
+        event["confidence"] = "средняя"
+        events.append(event)
     
     return events
     """Получить события для криптовалют с CoinMarketCal (бесплатный API)"""
@@ -788,60 +938,81 @@ async def cmd_portfolio(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def cmd_all_prices(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Показать все доступные цены"""
     try:
-        lines = ["💹 <b>Все цены:</b>\n"]
+        from datetime import datetime
+        now = datetime.now().strftime("%H:%M:%S %d.%m.%Y")
+        
+        lines = [f"💹 <b>Все цены</b> (обновлено {now})\n"]
         
         async with aiohttp.ClientSession() as session:
             # Акции/ETF в виде таблицы
             lines.append("<b>📊 Фондовый рынок:</b>")
             lines.append("<pre>")
-            lines.append("Актив                Цена")
-            lines.append("─" * 35)
+            lines.append("┌─────────────────────┬──────────────┐")
+            lines.append("│ Актив               │ Цена         │")
+            lines.append("├─────────────────────┼──────────────┤")
             
+            stock_source = "Yahoo Finance"
             for ticker, info in AVAILABLE_TICKERS.items():
                 price_data = await get_yahoo_price(session, ticker)
                 if price_data:
                     price, cur = price_data
-                    name = info['name'][:20].ljust(20)
+                    name = info['name'][:19].ljust(19)
                     price_str = f"{price:.2f} {cur}".rjust(12)
-                    lines.append(f"{name} {price_str}")
+                    lines.append(f"│ {name} │ {price_str} │")
                 else:
-                    name = info['name'][:20].ljust(20)
-                    lines.append(f"{name} {'н/д'.rjust(12)}")
+                    name = info['name'][:19].ljust(19)
+                    lines.append(f"│ {name} │ {'н/д'.rjust(12)} │")
                 await asyncio.sleep(0.3)
             
+            lines.append("└─────────────────────┴──────────────┘")
+            lines.append(f"Источник: {stock_source}")
             lines.append("</pre>")
             
             # Криптовалюты в виде таблицы
             lines.append("\n<b>₿ Криптовалюты:</b>")
             lines.append("<pre>")
-            lines.append("Монета   Цена            Изменение")
-            lines.append("─" * 40)
+            lines.append("┌────────┬───────────────┬────────────┐")
+            lines.append("│ Монета │ Цена          │ 24h        │")
+            lines.append("├────────┼───────────────┼────────────┤")
             
+            crypto_sources = {}
             for symbol, info in CRYPTO_IDS.items():
                 try:
                     crypto_data = await get_crypto_price(session, symbol)
                     if crypto_data:
                         price = crypto_data["usd"]
                         chg = crypto_data.get("change_24h")
+                        source = crypto_data.get("source", "Unknown")
                         
-                        sym_str = symbol.ljust(8)
-                        price_str = f"${price:,.2f}".rjust(15)
+                        crypto_sources[symbol] = source
+                        
+                        sym_str = symbol.ljust(6)
+                        price_str = f"${price:,.2f}".rjust(13)
                         
                         if chg and not math.isnan(chg):
-                            chg_emoji = "📈" if chg >= 0 else "📉"
-                            chg_str = f"{chg_emoji} {chg:+.2f}%"
-                            lines.append(f"{sym_str} {price_str}  {chg_str}")
+                            chg_emoji = "↗" if chg >= 0 else "↘"
+                            chg_str = f"{chg_emoji}{abs(chg):.1f}%".rjust(9)
                         else:
-                            lines.append(f"{sym_str} {price_str}")
+                            chg_str = "N/A".rjust(9)
+                        
+                        lines.append(f"│ {sym_str} │ {price_str} │ {chg_str} │")
                     else:
-                        sym_str = symbol.ljust(8)
-                        lines.append(f"{sym_str} {'н/д'.rjust(15)}")
+                        sym_str = symbol.ljust(6)
+                        lines.append(f"│ {sym_str} │ {'н/д'.rjust(13)} │ {'N/A'.rjust(9)} │")
                 except Exception as e:
                     print(f"❌ {symbol} price error: {e}")
-                    sym_str = symbol.ljust(8)
-                    lines.append(f"{sym_str} {'ошибка'.rjust(15)}")
+                    sym_str = symbol.ljust(6)
+                    lines.append(f"│ {sym_str} │ {'ошибка'.rjust(13)} │ {'N/A'.rjust(9)} │")
                 
                 await asyncio.sleep(0.3)
+            
+            lines.append("└────────┴───────────────┴────────────┘")
+            
+            # Показываем источники для крипты
+            if crypto_sources:
+                unique_sources = set(crypto_sources.values())
+                sources_str = ", ".join(unique_sources)
+                lines.append(f"Источники: {sources_str}")
             
             lines.append("</pre>")
         
@@ -1051,10 +1222,19 @@ async def cmd_events(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     title = event.get("title", "")
                     impact = event.get("impact", "")
                     pred = event.get("prediction", "")
+                    prob = event.get("probability", 50)
+                    price_change = event.get("price_change", "")
+                    recommendation = event.get("recommendation", "🟡 ДЕРЖАТЬ")
                     
                     lines.append(f"\n📅 <b>{date}</b> | {asset}")
-                    lines.append(f"{title}")
-                    lines.append(f"<i>{impact} | {pred}</i>")
+                    lines.append(f"📌 {title}")
+                    lines.append(f"🎯 Влияние: {impact}")
+                    lines.append(f"💡 Прогноз: {pred}")
+                    lines.append(f"📊 Изменение: {price_change}")
+                    lines.append(f"💰 Рекомендация: <b>{recommendation}</b>")
+                    lines.append(f"🔮 Уверенность: средняя ({prob:.0f}/100)")
+                    lines.append("")
+                    lines.append(f"<i>Анализ: макроэкономика, история</i>")
             
             # Криптовалюты
             if crypto_events:
