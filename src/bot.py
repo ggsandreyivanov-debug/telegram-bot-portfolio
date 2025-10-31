@@ -87,6 +87,8 @@ user_profiles: Dict[int, str] = {}
 
 # Conversation states
 SELECT_CRYPTO, ENTER_AMOUNT, ENTER_PRICE, ENTER_TARGET = range(4)
+# Portfolio add states
+SELECT_ASSET_TYPE, SELECT_ASSET, ENTER_ASSET_AMOUNT = range(4, 7)
 
 def get_main_menu():
     """Расширенное главное меню со ВСЕМИ функциями"""
@@ -760,19 +762,135 @@ async def cmd_my_trades(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("⚠ Ошибка при получении данных")
 
 async def cmd_add_asset(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Инструкция по добавлению в портфель (v1)"""
+    """Начало красивого диалога добавления актива"""
+    keyboard = [
+        [InlineKeyboardButton("📊 Акции / ETF", callback_data="asset_stocks")],
+        [InlineKeyboardButton("₿ Криптовалюты", callback_data="asset_crypto")],
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    
     await update.message.reply_text(
         "➕ <b>Добавить актив в портфель</b>\n\n"
-        "Используйте команду:\n"
-        "<code>/add TICKER КОЛИЧЕСТВО</code>\n\n"
-        "<b>Примеры:</b>\n"
-        "<code>/add VWCE.DE 10</code>\n"
-        "<code>/add BTC 0.5</code>\n\n"
-        "<b>Доступные тикеры:</b>\n"
-        "• VWCE.DE, 4GLD.DE, DE000A2T5DZ1.SG, SPY\n"
-        "• BTC, ETH, SOL, AVAX, DOGE, LINK",
+        "Выберите тип актива:",
+        parse_mode='HTML',
+        reply_markup=reply_markup
+    )
+    return SELECT_ASSET_TYPE
+
+async def add_asset_select_type(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Выбор типа актива"""
+    query = update.callback_query
+    await query.answer()
+    
+    asset_type = query.data.replace("asset_", "")
+    context.user_data['asset_type'] = asset_type
+    
+    keyboard = []
+    
+    if asset_type == "stocks":
+        context.user_data['asset_category'] = "stocks"
+        for ticker, info in AVAILABLE_TICKERS.items():
+            keyboard.append([InlineKeyboardButton(
+                f"{info['name']} ({ticker})",
+                callback_data=f"addticker_{ticker}"
+            )])
+    else:  # crypto
+        context.user_data['asset_category'] = "crypto"
+        for symbol, info in CRYPTO_IDS.items():
+            keyboard.append([InlineKeyboardButton(
+                f"{info['name']} ({symbol})",
+                callback_data=f"addcrypto_{symbol}"
+            )])
+    
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    
+    type_emoji = "📊" if asset_type == "stocks" else "₿"
+    type_name = "Акции / ETF" if asset_type == "stocks" else "Криптовалюты"
+    
+    await query.edit_message_text(
+        f"{type_emoji} <b>{type_name}</b>\n\n"
+        f"Выберите актив:",
+        parse_mode='HTML',
+        reply_markup=reply_markup
+    )
+    return SELECT_ASSET
+
+async def add_asset_select_item(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Выбор конкретного актива"""
+    query = update.callback_query
+    await query.answer()
+    
+    # Извлекаем тикер/символ из callback_data
+    if query.data.startswith("addticker_"):
+        ticker = query.data.replace("addticker_", "")
+        context.user_data['selected_asset'] = ticker
+        name = AVAILABLE_TICKERS[ticker]['name']
+        emoji = "📊"
+    else:  # addcrypto_
+        symbol = query.data.replace("addcrypto_", "")
+        context.user_data['selected_asset'] = symbol
+        name = CRYPTO_IDS[symbol]['name']
+        emoji = "₿"
+    
+    await query.edit_message_text(
+        f"✅ Выбрано: {emoji} <b>{name}</b>\n\n"
+        f"Введите количество:\n"
+        f"<i>Например: 10 или 0.5</i>",
         parse_mode='HTML'
     )
+    return ENTER_ASSET_AMOUNT
+
+async def add_asset_enter_amount(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Ввод количества актива"""
+    try:
+        amount = float(update.message.text.replace(",", "."))
+        if amount <= 0:
+            raise ValueError()
+        
+        user_id = update.effective_user.id
+        asset = context.user_data['selected_asset']
+        asset_category = context.user_data['asset_category']
+        
+        # Получаем имя для отображения
+        if asset_category == "stocks":
+            name = AVAILABLE_TICKERS[asset]['name']
+            emoji = "📊"
+        else:
+            name = CRYPTO_IDS[asset]['name']
+            emoji = "₿"
+        
+        # Добавляем в портфель
+        portfolio = get_user_portfolio(user_id)
+        old_amount = portfolio.get(asset, 0)
+        portfolio[asset] = old_amount + amount
+        save_portfolio(user_id, portfolio)
+        
+        await update.message.reply_text(
+            f"✅ <b>Добавлено в портфель!</b>\n\n"
+            f"{emoji} <b>{name}</b>\n"
+            f"Добавлено: {amount:.4f}\n"
+            f"Было: {old_amount:.4f}\n"
+            f"Стало: {portfolio[asset]:.4f}",
+            parse_mode='HTML',
+            reply_markup=get_main_menu()
+        )
+        
+        context.user_data.clear()
+        return ConversationHandler.END
+    
+    except:
+        await update.message.reply_text(
+            "❌ Введите корректное число\n"
+            "Например: <code>10</code> или <code>0.5</code>",
+            parse_mode='HTML'
+        )
+        return ENTER_ASSET_AMOUNT
+
+async def add_asset_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Отмена добавления актива"""
+    await update.message.reply_text("❌ Отменено", reply_markup=get_main_menu())
+    context.user_data.clear()
+    return ConversationHandler.END
 
 async def cmd_add(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Добавить актив в портфель (v1)"""
@@ -850,31 +968,108 @@ async def trade_enter_amount(update: Update, context: ContextTypes.DEFAULT_TYPE)
             raise ValueError()
         context.user_data['trade_amount'] = amount
         
-        await update.message.reply_text(
-            f"✅ Количество: <b>{amount:.4f}</b>\n\n"
-            f"Шаг 3: Цена покупки (USD):",
-            parse_mode='HTML'
-        )
+        # Получаем текущую цену
+        symbol = context.user_data['trade_symbol']
+        await update.message.reply_text("🔄 Получаю текущую цену...")
+        
+        async with aiohttp.ClientSession() as session:
+            crypto_data = await get_crypto_price(session, symbol)
+        
+        if crypto_data:
+            current_price = crypto_data["usd"]
+            # Автоматически устанавливаем текущую цену
+            context.user_data['trade_price'] = current_price
+            
+            # Кнопка для продолжения с текущей ценой
+            keyboard = [[InlineKeyboardButton(
+                f"➡️ Продолжить с ${current_price:,.4f}",
+                callback_data="price_continue"
+            )]]
+            reply_markup = InlineKeyboardMarkup(keyboard)
+            
+            await update.message.reply_text(
+                f"✅ Количество: <b>{amount:.4f}</b>\n\n"
+                f"Шаг 3: Цена покупки\n\n"
+                f"💡 <b>Установлена текущая цена: ${current_price:,.4f}</b>\n\n"
+                f"Что делать дальше:\n"
+                f"• Если купили только что → нажмите кнопку ниже ✅\n"
+                f"• Если купили раньше → просто введите свою цену\n\n"
+                f"Пример ввода: <code>0.18</code> или <code>2500</code>",
+                parse_mode='HTML',
+                reply_markup=reply_markup
+            )
+        else:
+            # Если не смогли получить цену, просим ввести вручную
+            await update.message.reply_text(
+                f"✅ Количество: <b>{amount:.4f}</b>\n\n"
+                f"⚠️ Не удалось получить текущую цену\n"
+                f"Шаг 3: Введите цену покупки (USD):",
+                parse_mode='HTML'
+            )
+        
         return ENTER_PRICE
     except:
         await update.message.reply_text("❌ Введите число, например: 0.5")
         return ENTER_AMOUNT
 
 async def trade_enter_price(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # Если нажата кнопка "Продолжить"
+    if update.callback_query:
+        query = update.callback_query
+        await query.answer()
+        
+        if query.data == "price_continue":
+            # Цена уже установлена в trade_enter_amount
+            price = context.user_data.get('trade_price')
+            
+            await query.edit_message_text(
+                f"✅ Цена входа: <b>${price:,.4f}</b>\n\n"
+                f"Шаг 4: Целевая прибыль (%)\n"
+                f"Введите процент прибыли (например: 10 для +10%):",
+                parse_mode='HTML'
+            )
+            return ENTER_TARGET
+    
+    # Если введена цена вручную
     try:
         price = float(update.message.text.replace(",", ""))
         if price <= 0:
             raise ValueError()
+        
+        # Проверка адекватности цены
+        symbol = context.user_data['trade_symbol']
+        current_price = context.user_data.get('trade_price')  # Текущая цена которую получили
+        
+        if current_price and price > current_price * 5:
+            # Если введенная цена в 5+ раз больше текущей
+            await update.message.reply_text(
+                f"⚠️ <b>Внимание!</b>\n\n"
+                f"Вы ввели: <b>${price:,.2f}</b>\n"
+                f"Текущая цена {symbol}: <b>${current_price:,.4f}</b>\n\n"
+                f"Возможно опечатка?\n\n"
+                f"Для DOGE правильная цена около ${current_price:,.4f}\n"
+                f"Если это действительно ваша цена входа, введите её ещё раз для подтверждения.",
+                parse_mode='HTML'
+            )
+            # Запоминаем что пользователь предупрежден
+            context.user_data['price_warning_shown'] = True
+            return ENTER_PRICE
+        
         context.user_data['trade_price'] = price
         
         await update.message.reply_text(
-            f"✅ Цена входа: <b>${price:,.2f}</b>\n\n"
-            f"Шаг 4: Целевая прибыль (%):",
+            f"✅ Цена входа: <b>${price:,.4f}</b>\n\n"
+            f"Шаг 4: Целевая прибыль (%)\n"
+            f"Введите процент прибыли (например: 10 для +10%):",
             parse_mode='HTML'
         )
         return ENTER_TARGET
     except:
-        await update.message.reply_text("❌ Введите число, например: 50000")
+        await update.message.reply_text(
+            "❌ Введите корректную цену\n"
+            "Например: <code>0.19</code> или <code>2500</code>",
+            parse_mode='HTML'
+        )
         return ENTER_PRICE
 
 async def trade_enter_target(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1035,6 +1230,12 @@ async def cmd_forecast(update: Update, context: ContextTypes.DEFAULT_TYPE):
         parse_mode='HTML'
     )
 
+async def cmd_test_alerts(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Тестирование алертов вручную"""
+    await update.message.reply_text("🧪 Запускаю ручную проверку алертов...")
+    await check_price_alerts(context)
+    await update.message.reply_text("✅ Проверка завершена! Смотрите логи бота.")
+
 async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Помощь"""
     await update.message.reply_text(
@@ -1050,9 +1251,15 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "• 🎯 Мои сделки - список позиций\n"
         "• 📊 Рыночные сигналы - BUY/HOLD/SELL\n"
         "• 👤 Мой профиль - тип инвестора\n\n"
+        "<b>🧪 Тестирование:</b>\n"
+        "• /test_alerts - проверить алерты вручную\n\n"
         "<b>Автоматические алерты:</b>\n"
         "• При изменении цены > порога (v1)\n"
-        "• При достижении целевой прибыли (v3)",
+        "• При достижении целевой прибыли (v3)\n\n"
+        "<b>⚠️ Как работают алерты:</b>\n"
+        "1. При первом запуске бот запоминает цены\n"
+        "2. Каждые 10 минут проверяет изменения\n"
+        "3. Если изменение > порога → отправляет алерт",
         parse_mode='HTML'
     )
 
@@ -1073,8 +1280,10 @@ async def handle_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif text == "🔮 Прогнозы":
         await cmd_forecast(update, context)
     elif text == "➕ Добавить актив":
-        await cmd_add_asset(update, context)
+        # Будет обработано ConversationHandler
+        return await cmd_add_asset(update, context)
     elif text == "🆕 Новая сделка":
+        # Будет обработано ConversationHandler
         return await cmd_new_trade(update, context)
     elif text == "👤 Мой профиль":
         await cmd_profile(update, context)
@@ -1117,10 +1326,24 @@ def main():
         states={
             SELECT_CRYPTO: [CallbackQueryHandler(trade_select_crypto, pattern='^trade_')],
             ENTER_AMOUNT: [MessageHandler(filters.TEXT & ~filters.COMMAND, trade_enter_amount)],
-            ENTER_PRICE: [MessageHandler(filters.TEXT & ~filters.COMMAND, trade_enter_price)],
+            ENTER_PRICE: [
+                CallbackQueryHandler(trade_enter_price, pattern='^price_'),  # Кнопка "Продолжить"
+                MessageHandler(filters.TEXT & ~filters.COMMAND, trade_enter_price)  # Ручной ввод
+            ],
             ENTER_TARGET: [MessageHandler(filters.TEXT & ~filters.COMMAND, trade_enter_target)],
         },
         fallbacks=[CommandHandler('cancel', trade_cancel)],
+    )
+    
+    # Conversation handler для добавления активов (НОВЫЙ)
+    add_asset_conv = ConversationHandler(
+        entry_points=[MessageHandler(filters.Regex('^➕ Добавить актив$'), cmd_add_asset)],
+        states={
+            SELECT_ASSET_TYPE: [CallbackQueryHandler(add_asset_select_type, pattern='^asset_')],
+            SELECT_ASSET: [CallbackQueryHandler(add_asset_select_item, pattern='^add(ticker|crypto)_')],
+            ENTER_ASSET_AMOUNT: [MessageHandler(filters.TEXT & ~filters.COMMAND, add_asset_enter_amount)],
+        },
+        fallbacks=[CommandHandler('cancel', add_asset_cancel)],
     )
     
     # Команды
@@ -1133,9 +1356,11 @@ def main():
     app.add_handler(CommandHandler("events", cmd_events))
     app.add_handler(CommandHandler("forecast", cmd_forecast))
     app.add_handler(CommandHandler("help", cmd_help))
+    app.add_handler(CommandHandler("test_alerts", cmd_test_alerts))
     
-    # Conversation и callbacks
+    # Conversation handlers (порядок важен!)
     app.add_handler(trade_conv)
+    app.add_handler(add_asset_conv)
     app.add_handler(CallbackQueryHandler(profile_select, pattern='^profile_'))
     
     # Кнопки
