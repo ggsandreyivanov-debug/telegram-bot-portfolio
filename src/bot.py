@@ -40,8 +40,16 @@ if not CHAT_ID:
     print("⚠ CHAT_ID не установлен - автоматические уведомления будут отключены")
 
 # === PATHS ===
-DATA_DIR = Path("/home/claude/bot_data")
-DATA_DIR.mkdir(exist_ok=True)
+# Используем текущую директорию или /tmp для совместимости с разными окружениями
+import os
+if os.path.exists("/home/claude"):
+    DATA_DIR = Path("/home/claude/bot_data")
+elif os.path.exists("/opt/render/project"):
+    DATA_DIR = Path("/opt/render/project/src/bot_data")
+else:
+    DATA_DIR = Path("./bot_data")
+
+DATA_DIR.mkdir(parents=True, exist_ok=True)  # parents=True создаст промежуточные директории
 CACHE_FILE = DATA_DIR / "price_cache.json"
 PORTFOLIO_FILE = DATA_DIR / "portfolios.json"
 TRADES_FILE = DATA_DIR / "trades.json"
@@ -83,6 +91,7 @@ class PriceCache:
     def __init__(self, ttl_seconds: int = 300):
         self.ttl = ttl_seconds
         self.cache: Dict[str, Dict] = {}
+        self.stats = {"api_calls": 0, "cache_hits": 0}  # Статистика
         self.load()
     
     def load(self):
@@ -115,6 +124,7 @@ class PriceCache:
             entry = self.cache[key]
             age = datetime.now().timestamp() - entry['timestamp']
             if age < self.ttl:
+                self.stats["cache_hits"] += 1
                 return entry['data']
         return None
     
@@ -124,6 +134,7 @@ class PriceCache:
             'data': data,
             'timestamp': datetime.now().timestamp()
         }
+        self.stats["api_calls"] += 1
         # Автосохранение каждые 10 записей
         if len(self.cache) % 10 == 0:
             self.save()
@@ -140,6 +151,18 @@ class PriceCache:
             self.cache[key] = {'data': {}, 'timestamp': datetime.now().timestamp()}
         self.cache[key]['data']['price'] = price
         self.save()
+    
+    def get_stats(self) -> str:
+        """Получить статистику использования кеша"""
+        total = self.stats["api_calls"] + self.stats["cache_hits"]
+        if total == 0:
+            return "No requests yet"
+        hit_rate = (self.stats["cache_hits"] / total) * 100
+        return f"API calls: {self.stats['api_calls']}, Cache hits: {self.stats['cache_hits']} ({hit_rate:.1f}%)"
+    
+    def reset_stats(self):
+        """Сбросить статистику"""
+        self.stats = {"api_calls": 0, "cache_hits": 0}
 
 # Глобальный кеш
 price_cache = PriceCache(ttl_seconds=300)  # 5 минут TTL
@@ -644,8 +667,15 @@ async def check_all_alerts(context: ContextTypes.DEFAULT_TYPE):
             if total_trade_alerts:
                 print(f"📤 Sent {total_trade_alerts} trade alerts to {len(trade_alerts)} users")
             
+            # Статистика кеша
+            cache_stats = price_cache.get_stats()
+            print(f"📊 Cache stats: {cache_stats}")
+            
             print(f"✅ Alerts check complete. Active assets: {len(active_assets)}, "
                   f"Price alerts: {len(price_alerts)}, Trade alerts: {total_trade_alerts}")
+            
+            # Сбрасываем статистику для следующего цикла
+            price_cache.reset_stats()
     
     except Exception as e:
         print(f"❌ check_all_alerts error: {e}")
