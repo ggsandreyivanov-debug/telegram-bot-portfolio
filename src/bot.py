@@ -136,6 +136,27 @@ async def get_yahoo_price(session: aiohttp.ClientSession, ticker: str) -> Option
     return None
 
 # ----------------- PRICES: Crypto APIs (v1 + v3) -----------------
+async def get_from_binance(session: aiohttp.ClientSession, symbol: str) -> Optional[Dict[str, float]]:
+    """Получить с Binance (основной источник - самый точный)"""
+    try:
+        url = "https://api.binance.com/api/v3/ticker/24hr"
+        params = {"symbol": f"{symbol}USDT"}
+        
+        async with session.get(url, params=params, timeout=TIMEOUT) as response:
+            if response.status == 200:
+                data = await response.json()
+                price = float(data.get("lastPrice", 0))
+                change_24h = float(data.get("priceChangePercent", 0))
+                
+                if price > 0:
+                    return {
+                        "usd": price,
+                        "change_24h": change_24h
+                    }
+    except Exception as e:
+        print(f"⚠️ Binance API error for {symbol}: {e}")
+    return None
+
 async def get_from_coinpaprika(session: aiohttp.ClientSession, crypto_info: dict) -> Optional[Dict[str, float]]:
     """Получить с CoinPaprika"""
     paprika_id = crypto_info["paprika"]
@@ -202,6 +223,7 @@ async def get_crypto_price(session: aiohttp.ClientSession, symbol: str) -> Optio
         return None
     
     sources = [
+        ("Binance", lambda: get_from_binance(session, symbol)),  # ← НОВЫЙ: Первый и самый точный!
         ("CoinPaprika", lambda: get_from_coinpaprika(session, crypto_info)),
         ("CoinGecko", lambda: get_from_coingecko(session, crypto_info)),
         ("CryptoCompare", lambda: get_from_cryptocompare(session, symbol)),
@@ -214,7 +236,7 @@ async def get_crypto_price(session: aiohttp.ClientSession, symbol: str) -> Optio
                 result["source"] = source_name
                 price = result['usd']
                 chg = result.get('change_24h')
-                if chg:
+                if chg and not math.isnan(chg):
                     print(f"✅ {symbol} from {source_name}: ${price:,.2f} ({chg:+.2f}%)")
                 else:
                     print(f"✅ {symbol} from {source_name}: ${price:,.2f}")
