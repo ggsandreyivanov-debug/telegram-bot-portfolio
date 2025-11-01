@@ -40,20 +40,32 @@ from telegram.ext import (
 class SupabaseStorage:
     """Работа с Supabase для сохранения данных между деплоями"""
     
-    def __init__(self, url: str, key: str):
+    def __init__(self, url: Optional[str], key: Optional[str]):
         self.url = url
         self.key = key
+        self.session: Optional[aiohttp.ClientSession] = None
         self.headers = {
             "apikey": key,
             "Authorization": f"Bearer {key}",
             "Content-Type": "application/json",
             "Prefer": "return=minimal"
-        }
+        } if key else {}
         self.enabled = bool(url and key)
         if self.enabled:
             print("✅ Supabase storage enabled")
         else:
             print("⚠️  Supabase storage disabled (no credentials)")
+    
+    async def _get_session(self) -> aiohttp.ClientSession:
+        """Переиспользуемая сессия"""
+        if self.session is None or self.session.closed:
+            self.session = aiohttp.ClientSession()
+        return self.session
+    
+    async def close(self):
+        """Закрыть сессию"""
+        if self.session and not self.session.closed:
+            await self.session.close()
     
     async def load_portfolios(self) -> Dict[int, Dict[str, float]]:
         """Загрузить портфели из Supabase"""
@@ -61,25 +73,30 @@ class SupabaseStorage:
             return {}
         
         try:
-            async with aiohttp.ClientSession() as session:
-                url = f"{self.url}/rest/v1/portfolios?select=*"
-                async with session.get(url, headers=self.headers, timeout=aiohttp.ClientTimeout(total=10)) as response:
-                    if response.status == 200:
-                        data = await response.json()
-                        portfolios = {}
-                        for row in data:
-                            try:
-                                user_id = int(row['user_id'])
-                                assets = json.loads(row['assets']) if isinstance(row['assets'], str) else row['assets']
+            session = await self._get_session()
+            url = f"{self.url}/rest/v1/portfolios?select=*"
+            async with session.get(url, headers=self.headers, timeout=aiohttp.ClientTimeout(total=10)) as response:
+                if response.status == 200:
+                    data = await response.json()
+                    portfolios = {}
+                    for row in data:
+                        try:
+                            user_id = int(row['user_id'])
+                            # ИСПРАВЛЕНИЕ: не используем json.loads - Supabase уже возвращает dict
+                            assets = row['assets']
+                            if isinstance(assets, dict):
                                 portfolios[user_id] = assets
-                            except (KeyError, ValueError, json.JSONDecodeError) as e:
-                                print(f"⚠️ Invalid portfolio row: {e}")
-                                continue
-                        print(f"✅ Loaded {len(portfolios)} portfolios from Supabase")
-                        return portfolios
-                    else:
-                        print(f"⚠️ Supabase load portfolios: HTTP {response.status}")
-                        return {}
+                        except (KeyError, ValueError, TypeError) as e:
+                            print(f"⚠️ Invalid portfolio row: {e}")
+                            continue
+                    print(f"✅ Loaded {len(portfolios)} portfolios from Supabase")
+                    return portfolios
+                else:
+                    # ИСПРАВЛЕНИЕ: логируем тело ответа при ошибке
+                    error_text = await response.text()
+                    print(f"⚠️ Supabase load portfolios: HTTP {response.status}")
+                    print(f"   Response: {error_text[:200]}")
+                    return {}
         except Exception as e:
             print(f"⚠️ Supabase load portfolios error: {e}")
             return {}
@@ -90,18 +107,25 @@ class SupabaseStorage:
             return
         
         try:
-            async with aiohttp.ClientSession() as session:
-                url = f"{self.url}/rest/v1/portfolios"
-                data = {
-                    "user_id": user_id,
-                    "assets": json.dumps(assets),
-                    "updated_at": datetime.utcnow().isoformat()
-                }
-                
-                headers = {**self.headers, "Prefer": "resolution=merge-duplicates"}
-                async with session.post(url, headers=headers, json=data, timeout=aiohttp.ClientTimeout(total=5)) as response:
-                    if response.status not in [200, 201, 204]:
-                        print(f"⚠️ Supabase save portfolio: HTTP {response.status}")
+            session = await self._get_session()
+            url = f"{self.url}/rest/v1/portfolios"
+            # ИСПРАВЛЕНИЕ: передаем dict напрямую, не json.dumps
+            data = {
+                "user_id": user_id,
+                "assets": assets,  # JSONB поле - принимает dict
+                "updated_at": datetime.utcnow().isoformat()
+            }
+            
+            headers = {**self.headers, "Prefer": "resolution=merge-duplicates"}
+            async with session.post(url, headers=headers, json=data, timeout=aiohttp.ClientTimeout(total=5)) as response:
+                # ИСПРАВЛЕНИЕ: 204 тоже успех
+                if response.status in [200, 201, 204]:
+                    pass  # Успех, молча
+                else:
+                    # ИСПРАВЛЕНИЕ: логируем тело ответа
+                    error_text = await response.text()
+                    print(f"⚠️ Supabase save portfolio: HTTP {response.status}")
+                    print(f"   Response: {error_text[:200]}")
         except Exception as e:
             print(f"⚠️ Supabase save portfolio error: {e}")
     
@@ -111,36 +135,39 @@ class SupabaseStorage:
             return {}
         
         try:
-            async with aiohttp.ClientSession() as session:
-                url = f"{self.url}/rest/v1/trades?select=*&order=created_at.desc"
-                async with session.get(url, headers=self.headers, timeout=aiohttp.ClientTimeout(total=10)) as response:
-                    if response.status == 200:
-                        data = await response.json()
-                        trades = {}
-                        for row in data:
-                            try:
-                                user_id = int(row['user_id'])
-                                if user_id not in trades:
-                                    trades[user_id] = []
-                                trades[user_id].append({
-                                    'id': row['id'],
-                                    'symbol': row['symbol'],
-                                    'amount': float(row['amount']),
-                                    'entry_price': float(row['entry_price']),
-                                    'target_profit_pct': float(row['target_profit_pct']),
-                                    'notified': bool(row.get('notified', False)),
-                                    'timestamp': row.get('created_at', datetime.utcnow().isoformat())
-                                })
-                            except (KeyError, ValueError, TypeError) as e:
-                                print(f"⚠️ Invalid trade row: {e}")
-                                continue
-                        
-                        total_trades = sum(len(t) for t in trades.values())
-                        print(f"✅ Loaded {total_trades} trades from Supabase")
-                        return trades
-                    else:
-                        print(f"⚠️ Supabase load trades: HTTP {response.status}")
-                        return {}
+            session = await self._get_session()
+            url = f"{self.url}/rest/v1/trades?select=*&order=created_at.desc"
+            async with session.get(url, headers=self.headers, timeout=aiohttp.ClientTimeout(total=10)) as response:
+                if response.status == 200:
+                    data = await response.json()
+                    trades = {}
+                    for row in data:
+                        try:
+                            user_id = int(row['user_id'])
+                            if user_id not in trades:
+                                trades[user_id] = []
+                            trades[user_id].append({
+                                'id': row['id'],
+                                'symbol': row['symbol'],
+                                'amount': float(row['amount']),
+                                'entry_price': float(row['entry_price']),
+                                'target_profit_pct': float(row['target_profit_pct']),
+                                'notified': bool(row.get('notified', False)),
+                                'timestamp': row.get('created_at', datetime.utcnow().isoformat())
+                            })
+                        except (KeyError, ValueError, TypeError) as e:
+                            print(f"⚠️ Invalid trade row: {e}")
+                            continue
+                    
+                    total_trades = sum(len(t) for t in trades.values())
+                    print(f"✅ Loaded {total_trades} trades from Supabase")
+                    return trades
+                else:
+                    # ИСПРАВЛЕНИЕ: логируем тело ответа
+                    error_text = await response.text()
+                    print(f"⚠️ Supabase load trades: HTTP {response.status}")
+                    print(f"   Response: {error_text[:200]}")
+                    return {}
         except Exception as e:
             print(f"⚠️ Supabase load trades error: {e}")
             return {}
@@ -152,24 +179,27 @@ class SupabaseStorage:
             return False
         
         try:
-            async with aiohttp.ClientSession() as session:
-                url = f"{self.url}/rest/v1/trades"
-                data = {
-                    "user_id": user_id,
-                    "symbol": symbol,
-                    "amount": amount,
-                    "entry_price": entry_price,
-                    "target_profit_pct": target_profit_pct,
-                    "notified": False,
-                    "created_at": datetime.utcnow().isoformat()
-                }
-                
-                async with session.post(url, headers=self.headers, json=data, timeout=aiohttp.ClientTimeout(total=5)) as response:
-                    if response.status in [200, 201]:
-                        return True
-                    else:
-                        print(f"⚠️ Supabase add trade: HTTP {response.status}")
-                        return False
+            session = await self._get_session()
+            url = f"{self.url}/rest/v1/trades"
+            # ИСПРАВЛЕНИЕ: не передаем created_at и notified - используем дефолты БД
+            data = {
+                "user_id": user_id,
+                "symbol": symbol,
+                "amount": amount,
+                "entry_price": entry_price,
+                "target_profit_pct": target_profit_pct
+            }
+            
+            async with session.post(url, headers=self.headers, json=data, timeout=aiohttp.ClientTimeout(total=5)) as response:
+                # ИСПРАВЛЕНИЕ: 204 тоже успех
+                if response.status in [200, 201, 204]:
+                    return True
+                else:
+                    # ИСПРАВЛЕНИЕ: логируем тело ответа
+                    error_text = await response.text()
+                    print(f"⚠️ Supabase add trade: HTTP {response.status}")
+                    print(f"   Response: {error_text[:200]}")
+                    return False
         except Exception as e:
             print(f"⚠️ Supabase add trade error: {e}")
             return False
@@ -180,13 +210,19 @@ class SupabaseStorage:
             return
         
         try:
-            async with aiohttp.ClientSession() as session:
-                url = f"{self.url}/rest/v1/trades?id=eq.{trade_id}"
-                data = {"notified": True}
-                
-                async with session.patch(url, headers=self.headers, json=data, timeout=aiohttp.ClientTimeout(total=5)) as response:
-                    if response.status not in [200, 204]:
-                        print(f"⚠️ Supabase update trade: HTTP {response.status}")
+            session = await self._get_session()
+            url = f"{self.url}/rest/v1/trades?id=eq.{trade_id}"
+            data = {"notified": True}
+            
+            async with session.patch(url, headers=self.headers, json=data, timeout=aiohttp.ClientTimeout(total=5)) as response:
+                # ИСПРАВЛЕНИЕ: 204 тоже успех
+                if response.status in [200, 204]:
+                    pass  # Успех, молча
+                else:
+                    # ИСПРАВЛЕНИЕ: логируем тело ответа
+                    error_text = await response.text()
+                    print(f"⚠️ Supabase update trade: HTTP {response.status}")
+                    print(f"   Response: {error_text[:200]}")
         except Exception as e:
             print(f"⚠️ Supabase update trade error: {e}")
 
@@ -2035,6 +2071,13 @@ def main():
                 print("  ✅ Data saved")
             except Exception as e:
                 print(f"  ⚠️ Error saving data: {e}")
+            
+            # Закрыть Supabase сессию
+            try:
+                await supabase_storage.close()
+                print("  ✅ Supabase session closed")
+            except Exception as e:
+                print(f"  ⚠️ Error closing Supabase: {e}")
             
             print("👋 Bot stopped gracefully")
     
