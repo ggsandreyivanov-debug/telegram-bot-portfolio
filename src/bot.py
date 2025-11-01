@@ -2273,22 +2273,41 @@ async def start_health_server():
 #   ДО того как Application.builder().build() создаст Updater,
 #   мы расширяем Updater.__slots__ этим именем.
 
+# === PATCH for PTB 20.x + Python 3.13 ===
+import inspect
+import telegram.ext as ext
+
 def monkeypatch_updater_slots():
+    """
+    Расширяет класс Updater, совместимый с Python 3.13,
+    создавая подкласс с нужным слотом и подменяя ext.Updater.
+    """
     try:
-        if hasattr(Updater, "__slots__"):
-            slots = list(Updater.__slots__)
-            if "_Updater__polling_cleanup_cb" not in slots:
-                slots.append("_Updater__polling_cleanup_cb")
-                Updater.__slots__ = tuple(slots)
-                print(
-                    "🐒 PTB hotfix applied: added _Updater__polling_cleanup_cb to Updater.__slots__"
-                )
-            else:
-                print("🐒 PTB hotfix: slot already present, nothing to do")
-        else:
-            print("🐒 PTB hotfix: Updater has no __slots__, skipping")
+        Upd = ext.Updater
+
+        # Проверяем, что поле действительно отсутствует
+        if "_Updater__polling_cleanup_cb" in getattr(Upd, "__slots__", ()):
+            print("🐒 PTB hotfix: slot already present, nothing to patch")
+            return
+
+        print("🐒 Rebuilding Updater class for Python 3.13 compatibility...")
+
+        class FixedUpdater(Upd):  # type: ignore
+            __slots__ = getattr(Upd, "__slots__", ()) + ("_Updater__polling_cleanup_cb",)
+
+            def __init__(self, *a, **kw):
+                super().__init__(*a, **kw)
+                # инициализация нового поля, чтобы не было AttributeError
+                object.__setattr__(self, "_Updater__polling_cleanup_cb", None)
+
+        # подменяем глобал в telegram.ext
+        ext.Updater = FixedUpdater
+        print("✅ PTB Updater successfully patched for Python 3.13")
+
     except Exception as e:
         print(f"⚠️ PTB hotfix failed: {e}")
+        import traceback; traceback.print_exc()
+
 
 # ========= MAIN RUNTIME =========
 
