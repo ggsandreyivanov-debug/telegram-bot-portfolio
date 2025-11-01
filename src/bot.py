@@ -35,6 +35,161 @@ from telegram.ext import (
     ConversationHandler,
 )
 
+# === SUPABASE STORAGE ===
+# Персистентное хранилище для данных (переживает деплои)
+class SupabaseStorage:
+    """Работа с Supabase для сохранения данных между деплоями"""
+    
+    def __init__(self, url: str, key: str):
+        self.url = url
+        self.key = key
+        self.headers = {
+            "apikey": key,
+            "Authorization": f"Bearer {key}",
+            "Content-Type": "application/json",
+            "Prefer": "return=minimal"
+        }
+        self.enabled = bool(url and key)
+        if self.enabled:
+            print("✅ Supabase storage enabled")
+        else:
+            print("⚠️  Supabase storage disabled (no credentials)")
+    
+    async def load_portfolios(self) -> Dict[int, Dict[str, float]]:
+        """Загрузить портфели из Supabase"""
+        if not self.enabled:
+            return {}
+        
+        try:
+            async with aiohttp.ClientSession() as session:
+                url = f"{self.url}/rest/v1/portfolios?select=*"
+                async with session.get(url, headers=self.headers, timeout=aiohttp.ClientTimeout(total=10)) as response:
+                    if response.status == 200:
+                        data = await response.json()
+                        portfolios = {}
+                        for row in data:
+                            try:
+                                user_id = int(row['user_id'])
+                                assets = json.loads(row['assets']) if isinstance(row['assets'], str) else row['assets']
+                                portfolios[user_id] = assets
+                            except (KeyError, ValueError, json.JSONDecodeError) as e:
+                                print(f"⚠️ Invalid portfolio row: {e}")
+                                continue
+                        print(f"✅ Loaded {len(portfolios)} portfolios from Supabase")
+                        return portfolios
+                    else:
+                        print(f"⚠️ Supabase load portfolios: HTTP {response.status}")
+                        return {}
+        except Exception as e:
+            print(f"⚠️ Supabase load portfolios error: {e}")
+            return {}
+    
+    async def save_portfolio(self, user_id: int, assets: Dict[str, float]):
+        """Сохранить портфель в Supabase (async, не блокирует)"""
+        if not self.enabled:
+            return
+        
+        try:
+            async with aiohttp.ClientSession() as session:
+                url = f"{self.url}/rest/v1/portfolios"
+                data = {
+                    "user_id": user_id,
+                    "assets": json.dumps(assets),
+                    "updated_at": datetime.utcnow().isoformat()
+                }
+                
+                headers = {**self.headers, "Prefer": "resolution=merge-duplicates"}
+                async with session.post(url, headers=headers, json=data, timeout=aiohttp.ClientTimeout(total=5)) as response:
+                    if response.status not in [200, 201, 204]:
+                        print(f"⚠️ Supabase save portfolio: HTTP {response.status}")
+        except Exception as e:
+            print(f"⚠️ Supabase save portfolio error: {e}")
+    
+    async def load_trades(self) -> Dict[int, List[Dict[str, Any]]]:
+        """Загрузить сделки из Supabase"""
+        if not self.enabled:
+            return {}
+        
+        try:
+            async with aiohttp.ClientSession() as session:
+                url = f"{self.url}/rest/v1/trades?select=*&order=created_at.desc"
+                async with session.get(url, headers=self.headers, timeout=aiohttp.ClientTimeout(total=10)) as response:
+                    if response.status == 200:
+                        data = await response.json()
+                        trades = {}
+                        for row in data:
+                            try:
+                                user_id = int(row['user_id'])
+                                if user_id not in trades:
+                                    trades[user_id] = []
+                                trades[user_id].append({
+                                    'id': row['id'],
+                                    'symbol': row['symbol'],
+                                    'amount': float(row['amount']),
+                                    'entry_price': float(row['entry_price']),
+                                    'target_profit_pct': float(row['target_profit_pct']),
+                                    'notified': bool(row.get('notified', False)),
+                                    'timestamp': row.get('created_at', datetime.utcnow().isoformat())
+                                })
+                            except (KeyError, ValueError, TypeError) as e:
+                                print(f"⚠️ Invalid trade row: {e}")
+                                continue
+                        
+                        total_trades = sum(len(t) for t in trades.values())
+                        print(f"✅ Loaded {total_trades} trades from Supabase")
+                        return trades
+                    else:
+                        print(f"⚠️ Supabase load trades: HTTP {response.status}")
+                        return {}
+        except Exception as e:
+            print(f"⚠️ Supabase load trades error: {e}")
+            return {}
+    
+    async def add_trade(self, user_id: int, symbol: str, amount: float, 
+                       entry_price: float, target_profit_pct: float) -> bool:
+        """Добавить сделку в Supabase"""
+        if not self.enabled:
+            return False
+        
+        try:
+            async with aiohttp.ClientSession() as session:
+                url = f"{self.url}/rest/v1/trades"
+                data = {
+                    "user_id": user_id,
+                    "symbol": symbol,
+                    "amount": amount,
+                    "entry_price": entry_price,
+                    "target_profit_pct": target_profit_pct,
+                    "notified": False,
+                    "created_at": datetime.utcnow().isoformat()
+                }
+                
+                async with session.post(url, headers=self.headers, json=data, timeout=aiohttp.ClientTimeout(total=5)) as response:
+                    if response.status in [200, 201]:
+                        return True
+                    else:
+                        print(f"⚠️ Supabase add trade: HTTP {response.status}")
+                        return False
+        except Exception as e:
+            print(f"⚠️ Supabase add trade error: {e}")
+            return False
+    
+    async def update_trade_notified(self, trade_id: int):
+        """Обновить статус уведомления"""
+        if not self.enabled:
+            return
+        
+        try:
+            async with aiohttp.ClientSession() as session:
+                url = f"{self.url}/rest/v1/trades?id=eq.{trade_id}"
+                data = {"notified": True}
+                
+                async with session.patch(url, headers=self.headers, json=data, timeout=aiohttp.ClientTimeout(total=5)) as response:
+                    if response.status not in [200, 204]:
+                        print(f"⚠️ Supabase update trade: HTTP {response.status}")
+        except Exception as e:
+            print(f"⚠️ Supabase update trade error: {e}")
+
 # === ENV ===
 TOKEN = os.getenv("BOT_TOKEN")
 CHAT_ID = os.getenv("CHAT_ID")
@@ -47,6 +202,9 @@ if not TOKEN:
     raise RuntimeError("⚠ BOT_TOKEN is not set in environment!")
 if not CHAT_ID:
     print("⚠ CHAT_ID не установлен - автоматические уведомления будут отключены")
+
+# Инициализация Supabase storage
+supabase_storage = SupabaseStorage(SUPABASE_URL, SUPABASE_KEY)
 
 # === PATHS ===
 # ИСПРАВЛЕНИЕ: Улучшенная логика определения директории данных
@@ -259,11 +417,34 @@ user_trades: Dict[int, List[Dict[str, Any]]] = {}
 user_profiles: Dict[int, str] = {}
 
 def load_data():
-    """ИСПРАВЛЕНИЕ: Загрузить данные с диска с валидацией"""
+    """ИСПРАВЛЕНИЕ: Загрузить данные - сначала из Supabase, потом из файлов (fallback)"""
     global user_portfolios, user_trades
     
-    # Загрузка портфелей
-    if PORTFOLIO_FILE.exists():
+    # Пытаемся загрузить из Supabase (приоритет)
+    try:
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        
+        # Загрузка портфелей из Supabase
+        supabase_portfolios = loop.run_until_complete(supabase_storage.load_portfolios())
+        if supabase_portfolios:
+            user_portfolios = supabase_portfolios
+            print(f"✅ Loaded {len(user_portfolios)} portfolios from Supabase")
+        
+        # Загрузка сделок из Supabase
+        supabase_trades = loop.run_until_complete(supabase_storage.load_trades())
+        if supabase_trades:
+            user_trades = supabase_trades
+            total = sum(len(t) for t in user_trades.values())
+            print(f"✅ Loaded {total} trades from Supabase")
+        
+        loop.close()
+    except Exception as e:
+        print(f"⚠️ Supabase load error: {e}")
+        print("   Trying local files as fallback...")
+    
+    # Fallback: загрузка из локальных файлов (если Supabase не сработал или пуст)
+    if not user_portfolios and PORTFOLIO_FILE.exists():
         try:
             with open(PORTFOLIO_FILE, 'r') as f:
                 data = json.load(f)
@@ -279,7 +460,7 @@ def load_data():
                     except (ValueError, TypeError):
                         continue
                 
-                print(f"✅ Loaded {len(user_portfolios)} portfolios")
+                print(f"✅ Loaded {len(user_portfolios)} portfolios from local file")
             else:
                 print(f"⚠️ Invalid portfolios format, resetting")
                 
@@ -288,8 +469,8 @@ def load_data():
         except Exception as e:
             print(f"⚠️ Portfolio load error: {e}")
     
-    # Загрузка сделок
-    if TRADES_FILE.exists():
+    # Fallback: загрузка сделок из локальных файлов
+    if not user_trades and TRADES_FILE.exists():
         try:
             with open(TRADES_FILE, 'r') as f:
                 data = json.load(f)
@@ -305,7 +486,7 @@ def load_data():
                     except (ValueError, TypeError):
                         continue
                 
-                print(f"✅ Loaded {len(user_trades)} trade lists")
+                print(f"✅ Loaded {len(user_trades)} trade lists from local file")
             else:
                 print(f"⚠️ Invalid trades format, resetting")
                 
@@ -315,7 +496,8 @@ def load_data():
             print(f"⚠️ Trades load error: {e}")
 
 def save_portfolios():
-    """ИСПРАВЛЕНИЕ: Атомарное сохранение портфелей"""
+    """ИСПРАВЛЕНИЕ: Атомарное сохранение портфелей - локально И в Supabase"""
+    # Сохраняем локально (для быстрого доступа)
     try:
         temp_file = PORTFOLIO_FILE.with_suffix('.tmp')
         with open(temp_file, 'w') as f:
@@ -327,6 +509,18 @@ def save_portfolios():
             temp_file.unlink(missing_ok=True)
         except:
             pass
+
+def save_portfolio(user_id: int, portfolio: Dict[str, float]):
+    """Сохранить портфель ГИБРИДНО: локально + Supabase"""
+    user_portfolios[user_id] = portfolio
+    save_portfolios()  # Локально (синхронно, быстро)
+    
+    # Supabase (асинхронно, не блокирует)
+    try:
+        loop = asyncio.get_event_loop()
+        loop.create_task(supabase_storage.save_portfolio(user_id, portfolio))
+    except Exception as e:
+        print(f"⚠️ Supabase async save error: {e}")
 
 def save_trades():
     """ИСПРАВЛЕНИЕ: Атомарное сохранение сделок"""
@@ -425,8 +619,23 @@ async def get_crypto_price_raw(session: aiohttp.ClientSession, symbol: str) -> O
         url = "https://api.binance.com/api/v3/ticker/24hr"
         params = {"symbol": binance_symbol}
         
+        print(f"🔍 Trying Binance for {symbol}...")  # ДОБАВЛЕНО для диагностики
+        
         async with session.get(url, params=params, timeout=TIMEOUT) as response:
-            if response.status == 200:
+            print(f"   Binance response status: {response.status}")  # ДОБАВЛЕНО
+            
+            if response.status != 200:
+                # УЛУЧШЕННОЕ логирование ошибок
+                if response.status == 429:
+                    print(f"⚠️ Binance rate limit for {symbol} (1200/min exceeded)")
+                elif response.status == 403:
+                    print(f"⚠️ Binance blocked for {symbol} (geo-block or firewall)")
+                elif response.status == 418:
+                    print(f"⚠️ Binance IP ban for {symbol}")
+                else:
+                    print(f"⚠️ Binance HTTP {response.status} for {symbol}")
+                # Продолжаем к fallback
+            else:
                 data = await response.json()
                 price = float(data.get("lastPrice", 0))
                 change_24h = float(data.get("priceChangePercent", 0))
@@ -439,8 +648,14 @@ async def get_crypto_price_raw(session: aiohttp.ClientSession, symbol: str) -> O
                         "change_24h": change_24h if not math.isnan(change_24h) else None,
                         "source": "Binance"
                     }
+                else:
+                    print(f"⚠️ Binance returned invalid price for {symbol}: {price}")
+    except asyncio.TimeoutError:
+        print(f"⚠️ Binance timeout for {symbol} (>{TIMEOUT.total}s)")
+    except aiohttp.ClientError as e:
+        print(f"⚠️ Binance connection error for {symbol}: {e}")
     except Exception as e:
-        print(f"⚠️ Binance failed for {symbol}: {e}")
+        print(f"⚠️ Binance failed for {symbol}: {type(e).__name__}: {e}")
     
     # 2. COINPAPRIKA (Fallback)
     try:
@@ -593,7 +808,7 @@ def get_user_trades(user_id: int) -> List[Dict[str, Any]]:
     return user_trades[user_id]
 
 def add_trade(user_id: int, symbol: str, amount: float, entry_price: float, target_profit_pct: float):
-    """Добавить новую сделку"""
+    """Добавить новую сделку ГИБРИДНО: локально + Supabase"""
     trades = get_user_trades(user_id)
     trade = {
         "symbol": symbol,
@@ -604,8 +819,15 @@ def add_trade(user_id: int, symbol: str, amount: float, entry_price: float, targ
         "notified": False
     }
     trades.append(trade)
-    save_trades()
+    save_trades()  # Локально (синхронно, быстро)
     print(f"✅ Added trade for user {user_id}: {symbol} x{amount} @ ${entry_price}")
+    
+    # Supabase (асинхронно, не блокирует)
+    try:
+        loop = asyncio.get_event_loop()
+        loop.create_task(supabase_storage.add_trade(user_id, symbol, amount, entry_price, target_profit_pct))
+    except Exception as e:
+        print(f"⚠️ Supabase async add trade error: {e}")
 
 # ----------------- Market Signals -----------------
 async def get_market_signal(session: aiohttp.ClientSession, symbol: str, investor_type: str) -> Dict[str, Any]:
