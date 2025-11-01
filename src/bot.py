@@ -1,42 +1,33 @@
-# BOT VERSION: 2025-10-31-OPTIMIZED-v5-FIXED-FULL
-# ИСПРАВЛЕНИЯ В ЭТОЙ ВЕРСИИ:
-# - Убрано дублирование save_portfolio(), осталась гибридная версия (локально + Supabase)
-# - Безопасная загрузка данных из Supabase без set_event_loop()
-# - Правильная работа с таймзоной (Europe/Riga через zoneinfo)
+# BOT VERSION: 2025-10-31-OPTIMIZED-v5-FIXED
+# ИСПРАВЛЕНИЯ В ЭТОМ РЕЛИЗЕ:
 # - Защита от division by zero
-# - Правильная обработка None значений
-# - Атомарная запись файлов
-# - Валидация JSON при загрузке
-# - Удалены hardcoded credentials
+# - Валидация None значений
+# - Атомарная запись файлов (save_* через temp + move)
+# - Гибридное хранение (локально + Supabase)
+# - Нет дублирующего save_portfolio()
+# - load_data() без set_event_loop(), без отдельного event loop
+# - Безопасная обработка JSON
+# - Без хардкода ключей
 # - Graceful shutdown
 # - Исправлена логика trade alerts
-# - Добавлена обработка ошибок импорта
-# - Добавлены расширенные логи при обращении к внешним API
+# - PTB 20.x hotfix для Python 3.13
 
 import os
-import sys
 import math
-import json
 import asyncio
 import traceback
-import tempfile
-import shutil
-from pathlib import Path
-from typing import Dict, Any, Optional, Tuple, List
-from datetime import datetime, timedelta, timezone as dt_timezone, time as dt_time
-from zoneinfo import ZoneInfo  # для корректного времени в Риге
-
 import aiohttp
 from aiohttp import web
+import json
+import sys
+import tempfile
+import shutil
+from typing import Dict, Any, Optional, Tuple, List
+from datetime import time as dt_time, datetime, timedelta, timezone
+from pathlib import Path
 
 import telegram
-from telegram import (
-    Update,
-    ReplyKeyboardMarkup,
-    KeyboardButton,
-    InlineKeyboardButton,
-    InlineKeyboardMarkup,
-)
+from telegram import Update, ReplyKeyboardMarkup, KeyboardButton, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     Application,
     CommandHandler,
@@ -47,23 +38,24 @@ from telegram.ext import (
     ConversationHandler,
 )
 
-# =========================
-# === SUPABASE STORAGE ====
-# =========================
-
+# === SUPABASE STORAGE ===
 class SupabaseStorage:
-    """Работа с Supabase для сохранения данных между деплоями"""
+    """Работа с Supabase для персистентного хранения между деплоями"""
 
     def __init__(self, url: Optional[str], key: Optional[str]):
         self.url = url
         self.key = key
         self.session: Optional[aiohttp.ClientSession] = None
-        self.headers = {
-            "apikey": key,
-            "Authorization": f"Bearer {key}",
-            "Content-Type": "application/json",
-            "Prefer": "return=minimal"
-        } if key else {}
+        self.headers = (
+            {
+                "apikey": key,
+                "Authorization": f"Bearer {key}",
+                "Content-Type": "application/json",
+                "Prefer": "return=minimal",
+            }
+            if key
+            else {}
+        )
         self.enabled = bool(url and key)
         if self.enabled:
             print("✅ Supabase storage enabled")
@@ -77,7 +69,7 @@ class SupabaseStorage:
         return self.session
 
     async def close(self):
-        """Закрыть сессию Supabase"""
+        """Закрыть aiohttp-сессию"""
         if self.session and not self.session.closed:
             await self.session.close()
 
@@ -95,9 +87,8 @@ class SupabaseStorage:
                     portfolios: Dict[int, Dict[str, float]] = {}
                     for row in data:
                         try:
-                            user_id = int(row['user_id'])
-                            # Supabase JSONB уже приходит как dict
-                            assets = row['assets']
+                            user_id = int(row["user_id"])
+                            assets = row["assets"]
                             if isinstance(assets, dict):
                                 portfolios[user_id] = assets
                         except (KeyError, ValueError, TypeError) as e:
@@ -115,23 +106,23 @@ class SupabaseStorage:
             return {}
 
     async def save_portfolio(self, user_id: int, assets: Dict[str, float]):
-        """Сохранить портфель в Supabase (async)"""
+        """Сохранить один портфель в Supabase (upsert)"""
         if not self.enabled:
             return
-
         try:
             session = await self._get_session()
             url = f"{self.url}/rest/v1/portfolios"
             data = {
                 "user_id": user_id,
-                "assets": assets,  # отправляем dict напрямую в JSONB
-                "updated_at": datetime.utcnow().isoformat()
+                "assets": assets,  # JSONB в Supabase — можно передавать dict
+                "updated_at": datetime.utcnow().isoformat(),
             }
-
             headers = {**self.headers, "Prefer": "resolution=merge-duplicates"}
-            async with session.post(url, headers=headers, json=data, timeout=aiohttp.ClientTimeout(total=5)) as response:
+            async with session.post(
+                url, headers=headers, json=data, timeout=aiohttp.ClientTimeout(total=5)
+            ) as response:
                 if response.status in [200, 201, 204]:
-                    # успех, молча
+                    # успех
                     return
                 else:
                     error_text = await response.text()
@@ -144,7 +135,6 @@ class SupabaseStorage:
         """Загрузить сделки из Supabase"""
         if not self.enabled:
             return {}
-
         try:
             session = await self._get_session()
             url = f"{self.url}/rest/v1/trades?select=*&order=created_at.desc"
@@ -154,22 +144,23 @@ class SupabaseStorage:
                     trades: Dict[int, List[Dict[str, Any]]] = {}
                     for row in data:
                         try:
-                            user_id = int(row['user_id'])
+                            user_id = int(row["user_id"])
                             if user_id not in trades:
                                 trades[user_id] = []
-                            trades[user_id].append({
-                                'id': row['id'],
-                                'symbol': row['symbol'],
-                                'amount': float(row['amount']),
-                                'entry_price': float(row['entry_price']),
-                                'target_profit_pct': float(row['target_profit_pct']),
-                                'notified': bool(row.get('notified', False)),
-                                'timestamp': row.get('created_at', datetime.utcnow().isoformat())
-                            })
+                            trades[user_id].append(
+                                {
+                                    "id": row["id"],
+                                    "symbol": row["symbol"],
+                                    "amount": float(row["amount"]),
+                                    "entry_price": float(row["entry_price"]),
+                                    "target_profit_pct": float(row["target_profit_pct"]),
+                                    "notified": bool(row.get("notified", False)),
+                                    "timestamp": row.get("created_at", datetime.utcnow().isoformat()),
+                                }
+                            )
                         except (KeyError, ValueError, TypeError) as e:
                             print(f"⚠️ Invalid trade row: {e}")
                             continue
-
                     total_trades = sum(len(t) for t in trades.values())
                     print(f"✅ Loaded {total_trades} trades from Supabase")
                     return trades
@@ -182,12 +173,17 @@ class SupabaseStorage:
             print(f"⚠️ Supabase load trades error: {e}")
             return {}
 
-    async def add_trade(self, user_id: int, symbol: str, amount: float,
-                        entry_price: float, target_profit_pct: float) -> bool:
+    async def add_trade(
+        self,
+        user_id: int,
+        symbol: str,
+        amount: float,
+        entry_price: float,
+        target_profit_pct: float,
+    ) -> bool:
         """Добавить сделку в Supabase"""
         if not self.enabled:
             return False
-
         try:
             session = await self._get_session()
             url = f"{self.url}/rest/v1/trades"
@@ -196,11 +192,11 @@ class SupabaseStorage:
                 "symbol": symbol,
                 "amount": amount,
                 "entry_price": entry_price,
-                "target_profit_pct": target_profit_pct
-                # created_at и notified проставит сама БД по дефолту
+                "target_profit_pct": target_profit_pct,
             }
-
-            async with session.post(url, headers=self.headers, json=data, timeout=aiohttp.ClientTimeout(total=5)) as response:
+            async with session.post(
+                url, headers=self.headers, json=data, timeout=aiohttp.ClientTimeout(total=5)
+            ) as response:
                 if response.status in [200, 201, 204]:
                     return True
                 else:
@@ -213,16 +209,16 @@ class SupabaseStorage:
             return False
 
     async def update_trade_notified(self, trade_id: int):
-        """Обновить статус сделки на notified=True"""
+        """Пометить сделку как notified=True"""
         if not self.enabled:
             return
-
         try:
             session = await self._get_session()
             url = f"{self.url}/rest/v1/trades?id=eq.{trade_id}"
             data = {"notified": True}
-
-            async with session.patch(url, headers=self.headers, json=data, timeout=aiohttp.ClientTimeout(total=5)) as response:
+            async with session.patch(
+                url, headers=self.headers, json=data, timeout=aiohttp.ClientTimeout(total=5)
+            ) as response:
                 if response.status in [200, 204]:
                     return
                 else:
@@ -233,35 +229,29 @@ class SupabaseStorage:
             print(f"⚠️ Supabase update trade error: {e}")
 
 
-# ======================
-# === ENV VARIABLES ====
-# ======================
-
+# === ENV ===
 TOKEN = os.getenv("BOT_TOKEN")
 CHAT_ID = os.getenv("CHAT_ID")
-LUNARCRUSH_API_KEY = os.getenv("LUNARCRUSH_API_KEY")
+LUNARCRUSH_API_KEY = os.getenv("LUNARCRUSH_API_KEY")  # (на будущее, сейчас не юзается)
 SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_KEY = os.getenv("SUPABASE_KEY")
 
 if not TOKEN:
     raise RuntimeError("⚠ BOT_TOKEN is not set in environment!")
 if not CHAT_ID:
-    print("⚠ CHAT_ID не установлен - автоматические уведомления будут отключены")
+    print("⚠ CHAT_ID не установлен - автоматические уведомления в общий канал будут отключены")
 
-# Инициализация Supabase storage
 supabase_storage = SupabaseStorage(SUPABASE_URL, SUPABASE_KEY)
 
-# =======================
-# === PATHS / STORAGE ===
-# =======================
 
+# === PATHS ===
 def get_data_directory() -> Path:
-    """Определить безопасную директорию для данных с проверкой прав записи"""
+    """Определяем куда писать данные так, чтобы у процесса были права."""
     possible_dirs = [
         Path("/home/claude/bot_data"),
         Path("/opt/render/project/src/bot_data"),
         Path("./bot_data"),
-        Path(tempfile.gettempdir()) / "bot_data"
+        Path(tempfile.gettempdir()) / "bot_data",
     ]
 
     for dir_path in possible_dirs:
@@ -283,17 +273,14 @@ CACHE_FILE = DATA_DIR / "price_cache.json"
 PORTFOLIO_FILE = DATA_DIR / "portfolios.json"
 TRADES_FILE = DATA_DIR / "trades.json"
 
-# ====================
-# === CONFIG / API ===
-# ====================
-
+# === REQUEST CONFIG ===
 HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
     "Accept": "application/json",
 }
 TIMEOUT = aiohttp.ClientTimeout(total=15)
 
-# Доступные тикеры (стоки/ETF)
+# Доступные тикеры
 AVAILABLE_TICKERS = {
     "VWCE.DE": {"name": "VWCE", "type": "stock"},
     "4GLD.DE": {"name": "4GLD (Gold ETC)", "type": "stock"},
@@ -301,7 +288,7 @@ AVAILABLE_TICKERS = {
     "SPY": {"name": "S&P 500 (SPY)", "type": "stock"},
 }
 
-# Крипто-активы
+# Крипта
 CRYPTO_IDS = {
     "BTC": {"binance": "BTCUSDT", "coingecko": "bitcoin", "paprika": "btc-bitcoin", "name": "Bitcoin"},
     "ETH": {"binance": "ETHUSDT", "coingecko": "ethereum", "paprika": "eth-ethereum", "name": "Ethereum"},
@@ -311,53 +298,51 @@ CRYPTO_IDS = {
     "LINK": {"binance": "LINKUSDT", "coingecko": "chainlink", "paprika": "link-chainlink", "name": "Chainlink"},
 }
 
-# Пороги оповещений
+# Пороги движения цены для алертов
 THRESHOLDS = {
-    "stocks": 1.0,   # % изменения за интервал проверки
-    "crypto": 4.0,   # % изменения за интервал проверки
+    "stocks": 1.0,
+    "crypto": 4.0,
 }
 
-# =====================
-# === PRICE CACHE  ====
-# =====================
 
+# === КЕШ ЦЕН ===
 class PriceCache:
-    """Кеш с TTL, персистентностью и защитой от мусора"""
+    """TTL-кеш с персистентностью для цен и для алертов."""
 
     def __init__(self, ttl_seconds: int = 300):
         self.ttl = ttl_seconds
-        self.cache: Dict[str, Dict] = {}
+        self.cache: Dict[str, Dict[str, Any]] = {}
         self.stats = {"api_calls": 0, "cache_hits": 0}
         self.load()
 
     def load(self):
-        """Загрузить кеш с диска с валидацией"""
+        """Загружаем кеш из файла с валидацией структуры."""
         if not CACHE_FILE.exists():
             return
-
         try:
-            with open(CACHE_FILE, 'r') as f:
+            with open(CACHE_FILE, "r") as f:
                 data = json.load(f)
 
             if not isinstance(data, dict):
                 print("⚠️ Invalid cache format, resetting")
                 return
 
-            now = datetime.now().timestamp()
-            valid_entries = 0
-
+            now_ts = datetime.now().timestamp()
+            restored = 0
             for k, v in data.items():
-                if not isinstance(v, dict) or 'timestamp' not in v or 'data' not in v:
+                if not isinstance(v, dict):
+                    continue
+                if "timestamp" not in v or "data" not in v:
                     continue
                 try:
-                    ts = float(v['timestamp'])
-                    if now - ts < self.ttl * 2:
+                    ts_val = float(v["timestamp"])
+                    if now_ts - ts_val < self.ttl * 2:
                         self.cache[k] = v
-                        valid_entries += 1
+                        restored += 1
                 except (ValueError, TypeError):
                     continue
 
-            print(f"✅ Loaded {valid_entries} valid prices from cache")
+            print(f"✅ Loaded {restored} valid prices from cache")
 
         except json.JSONDecodeError as e:
             print(f"⚠️ Cache JSON corrupted: {e}, resetting")
@@ -367,52 +352,52 @@ class PriceCache:
             self.cache = {}
 
     def save(self):
-        """Атомарная запись кеша"""
+        """Атомарная запись кеша на диск."""
         try:
-            temp_file = CACHE_FILE.with_suffix('.tmp')
-            with open(temp_file, 'w') as f:
+            tmp = CACHE_FILE.with_suffix(".tmp")
+            with open(tmp, "w") as f:
                 json.dump(self.cache, f, indent=2)
-            shutil.move(str(temp_file), str(CACHE_FILE))
+            shutil.move(str(tmp), str(CACHE_FILE))
         except Exception as e:
             print(f"⚠️ Cache save error: {e}")
             try:
-                temp_file.unlink(missing_ok=True)
+                tmp.unlink(missing_ok=True)
             except Exception:
                 pass
 
-    def get(self, key: str) -> Optional[Dict]:
-        """Получить годные данные из кеша (с TTL)"""
-        if key in self.cache:
-            entry = self.cache[key]
-            if not isinstance(entry, dict) or 'timestamp' not in entry:
-                del self.cache[key]
-                return None
-            try:
-                age = datetime.now().timestamp() - float(entry['timestamp'])
-                if age < self.ttl:
-                    self.stats["cache_hits"] += 1
-                    return entry.get('data')
-            except (ValueError, TypeError):
-                del self.cache[key]
-                return None
+    def get(self, key: str) -> Optional[Dict[str, Any]]:
+        """Вернуть данные из кеша (учитывая TTL)."""
+        if key not in self.cache:
+            return None
+        entry = self.cache[key]
+        if not isinstance(entry, dict) or "timestamp" not in entry:
+            del self.cache[key]
+            return None
+        try:
+            age = datetime.now().timestamp() - float(entry["timestamp"])
+            if age < self.ttl:
+                self.stats["cache_hits"] += 1
+                return entry.get("data")
+        except (ValueError, TypeError):
+            del self.cache[key]
+            return None
         return None
 
-    def set(self, key: str, data: Dict):
-        """Сохранить объект в кеш"""
+    def set(self, key: str, data: Dict[str, Any]):
+        """Положить данные в кеш."""
         self.cache[key] = {
-            'data': data,
-            'timestamp': datetime.now().timestamp()
+            "data": data,
+            "timestamp": datetime.now().timestamp(),
         }
         self.stats["api_calls"] += 1
-        # авто-подсохранение
         if len(self.cache) % 10 == 0:
             self.save()
 
     def get_for_alert(self, key: str) -> Optional[float]:
-        """Получить last price для алертов (без TTL-проверки)"""
+        """Достать последнюю цену для алертов (без TTL)."""
         if key in self.cache:
-            data = self.cache[key].get('data', {})
-            price = data.get('price')
+            data = self.cache[key].get("data", {})
+            price = data.get("price")
             if price is not None:
                 try:
                     return float(price)
@@ -421,7 +406,7 @@ class PriceCache:
         return None
 
     def set_for_alert(self, key: str, price: float):
-        """Сохранить last price для алертов"""
+        """Запомнить текущую цену как baseline для будущего сравнения."""
         try:
             price = float(price)
             if math.isnan(price) or math.isinf(price):
@@ -432,8 +417,8 @@ class PriceCache:
             return
 
         if key not in self.cache:
-            self.cache[key] = {'data': {}, 'timestamp': datetime.now().timestamp()}
-        self.cache[key]['data']['price'] = price
+            self.cache[key] = {"data": {}, "timestamp": datetime.now().timestamp()}
+        self.cache[key]["data"]["price"] = price
         self.save()
 
     def get_stats(self) -> str:
@@ -449,193 +434,203 @@ class PriceCache:
 
 price_cache = PriceCache(ttl_seconds=300)
 
-# ==========================
-# === RUNTIME STRUCTURES ===
-# ==========================
 
+# === ГЛОБАЛЬНОЕ СОСТОЯНИЕ ===
 user_portfolios: Dict[int, Dict[str, float]] = {}
 user_trades: Dict[int, List[Dict[str, Any]]] = {}
-user_profiles: Dict[int, str] = {}
+user_profiles: Dict[int, str] = {}  # long / swing / day
 
-def fetch_initial_data_from_supabase() -> Tuple[Dict[int, Dict[str, float]], Dict[int, List[Dict[str, Any]]]]:
-    """
-    Безопасно стянуть портфели и сделки из Supabase в момент старта.
-    Важно: не трогаем глобальный event loop, создаём временный.
-    """
-    if not supabase_storage.enabled:
-        return {}, {}
 
-    tmp_loop = asyncio.new_event_loop()
-    try:
-        portfolios = tmp_loop.run_until_complete(supabase_storage.load_portfolios())
-        trades = tmp_loop.run_until_complete(supabase_storage.load_trades())
-    except Exception as e:
-        print(f"⚠️ Supabase load error: {e}")
-        portfolios = {}
-        trades = {}
-    finally:
-        tmp_loop.close()
-
-    return portfolios or {}, trades or {}
-
-def load_data():
-    """
-    Загрузка данных при старте бота.
-    Приоритет:
-    1. Supabase (если доступен и содержит данные)
-    2. Локальные файлы (fallback)
-    """
+async def async_init_from_supabase():
+    """Загружаем стартовые данные в память (портфели и сделки) из Supabase, с fallback на локальные файлы."""
     global user_portfolios, user_trades
 
-    # 1. Supabase
-    supabase_portfolios, supabase_trades = fetch_initial_data_from_supabase()
+    # 1. Попробовать Supabase
+    try:
+        sup_p = await supabase_storage.load_portfolios()
+        if sup_p:
+            user_portfolios = sup_p
+            print(f"✅ Loaded {len(user_portfolios)} portfolios from Supabase (boot)")
+    except Exception as e:
+        print(f"⚠️ Supabase portfolios load exception: {e}")
 
-    if supabase_portfolios:
-        user_portfolios = supabase_portfolios
-        print(f"✅ Loaded {len(user_portfolios)} portfolios from Supabase")
+    try:
+        sup_t = await supabase_storage.load_trades()
+        if sup_t:
+            user_trades = sup_t
+            total = sum(len(t) for t in user_trades.values())
+            print(f"✅ Loaded {total} trades from Supabase (boot)")
+    except Exception as e:
+        print(f"⚠️ Supabase trades load exception: {e}")
 
-    if supabase_trades:
-        user_trades = supabase_trades
-        total = sum(len(t) for t in user_trades.values())
-        print(f"✅ Loaded {total} trades from Supabase")
-
-    # 2. Fallback: локальные портфели
-    if (not user_portfolios) and PORTFOLIO_FILE.exists():
+    # 2. Fallback: если supabase вернул пусто — пробуем локальные файлы
+    if not user_portfolios and PORTFOLIO_FILE.exists():
         try:
-            with open(PORTFOLIO_FILE, 'r') as f:
+            with open(PORTFOLIO_FILE, "r") as f:
                 data = json.load(f)
-
             if isinstance(data, dict):
-                restored: Dict[int, Dict[str, float]] = {}
+                tmp: Dict[int, Dict[str, float]] = {}
                 for k, v in data.items():
                     try:
                         uid = int(k)
                         if isinstance(v, dict):
-                            restored[uid] = v
+                            tmp[uid] = v
                     except (ValueError, TypeError):
                         continue
-                user_portfolios = restored
-                print(f"✅ Loaded {len(user_portfolios)} portfolios from local file")
+                user_portfolios = tmp
+                print(f"✅ Loaded {len(user_portfolios)} portfolios from local file (fallback)")
             else:
-                print("⚠️ Invalid portfolios format in local file, skipping")
-
+                print("⚠️ Invalid portfolios JSON structure (fallback)")
         except json.JSONDecodeError as e:
-            print(f"⚠️ Portfolios JSON corrupted: {e}, skipping")
+            print(f"⚠️ Portfolios JSON corrupted: {e}")
         except Exception as e:
             print(f"⚠️ Portfolio load error: {e}")
 
-    # 3. Fallback: локальные сделки
-    if (not user_trades) and TRADES_FILE.exists():
+    if not user_trades and TRADES_FILE.exists():
         try:
-            with open(TRADES_FILE, 'r') as f:
+            with open(TRADES_FILE, "r") as f:
                 data = json.load(f)
-
             if isinstance(data, dict):
-                restored_trades: Dict[int, List[Dict[str, Any]]] = {}
+                tmp_t: Dict[int, List[Dict[str, Any]]] = {}
                 for k, v in data.items():
                     try:
                         uid = int(k)
                         if isinstance(v, list):
-                            restored_trades[uid] = v
+                            tmp_t[uid] = v
                     except (ValueError, TypeError):
                         continue
-
-                user_trades = restored_trades
-                print(f"✅ Loaded {len(user_trades)} trade lists from local file")
+                user_trades = tmp_t
+                print(f"✅ Loaded {len(user_trades)} trade lists from local file (fallback)")
             else:
-                print("⚠️ Invalid trades format in local file, skipping")
-
+                print("⚠️ Invalid trades JSON structure (fallback)")
         except json.JSONDecodeError as e:
-            print(f"⚠️ Trades JSON corrupted: {e}, skipping")
+            print(f"⚠️ Trades JSON corrupted: {e}")
         except Exception as e:
             print(f"⚠️ Trades load error: {e}")
 
-def save_portfolios():
-    """Атомарно сохранить ВСЕ портфели локально"""
+
+def save_portfolios_local():
+    """Сохраняем ВСЕ портфели локально (атомарная запись)."""
     try:
-        temp_file = PORTFOLIO_FILE.with_suffix('.tmp')
-        with open(temp_file, 'w') as f:
+        tmp = PORTFOLIO_FILE.with_suffix(".tmp")
+        with open(tmp, "w") as f:
             json.dump(user_portfolios, f, indent=2)
-        shutil.move(str(temp_file), str(PORTFOLIO_FILE))
+        shutil.move(str(tmp), str(PORTFOLIO_FILE))
     except Exception as e:
         print(f"⚠️ Portfolio save error: {e}")
         try:
-            temp_file.unlink(missing_ok=True)
+            tmp.unlink(missing_ok=True)
         except Exception:
             pass
 
+
+def save_trades_local():
+    """Сохраняем ВСЕ сделки локально (атомарная запись)."""
+    try:
+        tmp = TRADES_FILE.with_suffix(".tmp")
+        with open(tmp, "w") as f:
+            json.dump(user_trades, f, indent=2)
+        shutil.move(str(tmp), str(TRADES_FILE))
+    except Exception as e:
+        print(f"⚠️ Trades save error: {e}")
+        try:
+            tmp.unlink(missing_ok=True)
+        except Exception:
+            pass
+
+
 def save_portfolio(user_id: int, portfolio: Dict[str, float]):
-    """Сохранить портфель ГИБРИДНО: локально + Supabase"""
+    """
+    Сохранить портфель гибридно:
+    - в память
+    - локально (синхронно, атомарно весь словарь)
+    - в Supabase (асинхронно, не блокируем основной поток)
+    """
     user_portfolios[user_id] = portfolio
+    save_portfolios_local()
 
-    # Локально (синхронно)
-    save_portfolios()
-
-    # В Supabase — асинхронно
     try:
         loop = asyncio.get_event_loop()
         loop.create_task(supabase_storage.save_portfolio(user_id, portfolio))
     except Exception as e:
         print(f"⚠️ Supabase async save error: {e}")
 
-def save_trades():
-    """Атомарно сохранить ВСЕ сделки локально"""
+
+def get_user_portfolio(user_id: int) -> Dict[str, float]:
+    """Вернуть портфель пользователя, инициализировать пустой если нет."""
+    if user_id not in user_portfolios:
+        user_portfolios[user_id] = {
+            "VWCE.DE": 0,
+            "DE000A2T5DZ1.SG": 0,
+            "BTC": 0,
+            "ETH": 0,
+            "SOL": 0,
+        }
+    return user_portfolios[user_id]
+
+
+def get_user_trades(user_id: int) -> List[Dict[str, Any]]:
+    """Вернуть сделки юзера, создать пустой список если нет."""
+    if user_id not in user_trades:
+        user_trades[user_id] = []
+    return user_trades[user_id]
+
+
+def add_trade(user_id: int, symbol: str, amount: float, entry_price: float, target_profit_pct: float):
+    """Добавить новую сделку. Локально сохраняем сразу, в Supabase пушим в фоне."""
+    trades = get_user_trades(user_id)
+    trade = {
+        "symbol": symbol,
+        "amount": amount,
+        "entry_price": entry_price,
+        "target_profit_pct": target_profit_pct,
+        "timestamp": datetime.now().isoformat(),
+        "notified": False,
+    }
+    trades.append(trade)
+    save_trades_local()
+    print(f"✅ Added trade for user {user_id}: {symbol} x{amount} @ ${entry_price}")
+
     try:
-        temp_file = TRADES_FILE.with_suffix('.tmp')
-        with open(temp_file, 'w') as f:
-            json.dump(user_trades, f, indent=2)
-        shutil.move(str(temp_file), str(TRADES_FILE))
+        loop = asyncio.get_event_loop()
+        loop.create_task(supabase_storage.add_trade(user_id, symbol, amount, entry_price, target_profit_pct))
     except Exception as e:
-        print(f"⚠️ Trades save error: {e}")
-        try:
-            temp_file.unlink(missing_ok=True)
-        except Exception:
-            pass
+        print(f"⚠️ Supabase async add trade error: {e}")
 
-# Загрузка при старте процесса
-load_data()
 
-# ===========================
-# === INVESTOR PROFILES  ====
-# ===========================
+def get_all_active_assets() -> Dict[str, List[int]]:
+    """
+    Собираем все активы (акции и крипта) по всем пользователям, у которых есть
+    либо позиция в портфеле >0, либо сделки.
+    Это нужно для check_all_alerts().
+    """
+    active_assets: Dict[str, List[int]] = {}
 
-INVESTOR_TYPES = {
-    "long": {
-        "name": "Долгосрочный инвестор",
-        "emoji": "🏔️",
-        "desc": "Покупаю на страхе, держу годами"
-    },
-    "swing": {
-        "name": "Свинг-трейдер",
-        "emoji": "🌊",
-        "desc": "Ловлю волны, держу дни-недели"
-    },
-    "day": {
-        "name": "Дневной трейдер",
-        "emoji": "⚡",
-        "desc": "Быстрые сделки внутри дня"
-    },
-}
+    for uid, portfolio in user_portfolios.items():
+        for ticker, qty in portfolio.items():
+            try:
+                if float(qty) > 0:
+                    if ticker not in active_assets:
+                        active_assets[ticker] = []
+                    if uid not in active_assets[ticker]:
+                        active_assets[ticker].append(uid)
+            except (ValueError, TypeError):
+                continue
 
-# Conversation states
-SELECT_CRYPTO, ENTER_AMOUNT, ENTER_PRICE, ENTER_TARGET = range(4)
-SELECT_ASSET_TYPE, SELECT_ASSET, ENTER_ASSET_AMOUNT = range(4, 7)
+    for uid, trades_list in user_trades.items():
+        for tr in trades_list:
+            symbol = tr.get("symbol")
+            if not symbol:
+                continue
+            if symbol not in active_assets:
+                active_assets[symbol] = []
+            if uid not in active_assets[symbol]:
+                active_assets[symbol].append(uid)
 
-def get_main_menu():
-    """Главное меню в виде клавиатуры"""
-    keyboard = [
-        [KeyboardButton("💼 Мой портфель"), KeyboardButton("💹 Все цены")],
-        [KeyboardButton("🎯 Мои сделки"), KeyboardButton("📊 Рыночные сигналы")],
-        [KeyboardButton("📰 События недели"), KeyboardButton("🔮 Прогнозы")],
-        [KeyboardButton("➕ Добавить актив"), KeyboardButton("🆕 Новая сделка")],
-        [KeyboardButton("👤 Мой профиль"), KeyboardButton("ℹ️ Помощь")],
-    ]
-    return ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
+    return active_assets
 
-# =============================
-# === HTTP / PRICE FETCHERS ===
-# =============================
 
+# === HTTP helper ===
 async def get_json(session: aiohttp.ClientSession, url: str, params=None) -> Optional[Dict[str, Any]]:
     try:
         async with session.get(url, params=params, headers=HEADERS, timeout=TIMEOUT) as r:
@@ -647,8 +642,13 @@ async def get_json(session: aiohttp.ClientSession, url: str, params=None) -> Opt
         print(f"❌ get_json({url}) error: {e}")
         return None
 
+
+# === Цены акций/ETF (Yahoo Finance) ===
 async def get_yahoo_price(session: aiohttp.ClientSession, ticker: str) -> Optional[Tuple[float, str, float]]:
-    """Получить цену акции/ETF с Yahoo Finance c валидацией"""
+    """
+    Возвращает кортеж:
+      (текущая цена, валюта, изменение % за день)
+    """
     try:
         url = f"https://query2.finance.yahoo.com/v8/finance/chart/{ticker}"
         params = {"interval": "1d", "range": "1d"}
@@ -660,7 +660,7 @@ async def get_yahoo_price(session: aiohttp.ClientSession, ticker: str) -> Option
         result = data.get("chart", {}).get("result", [{}])[0]
         meta = result.get("meta", {})
         price = meta.get("regularMarketPrice")
-        cur = meta.get("currency", "USD")
+        currency = meta.get("currency", "USD")
         change_pct = meta.get("regularMarketChangePercent", 0)
 
         if price is not None:
@@ -668,7 +668,7 @@ async def get_yahoo_price(session: aiohttp.ClientSession, ticker: str) -> Option
                 price = float(price)
                 change_pct = float(change_pct) if change_pct is not None else 0.0
                 if not math.isnan(price) and not math.isinf(price):
-                    return (price, cur, change_pct)
+                    return (price, currency, change_pct)
             except (ValueError, TypeError):
                 pass
 
@@ -677,28 +677,27 @@ async def get_yahoo_price(session: aiohttp.ClientSession, ticker: str) -> Option
 
     return None
 
+
+# === Цены крипты (Binance -> Paprika -> CoinGecko) ===
 async def get_crypto_price_raw(session: aiohttp.ClientSession, symbol: str) -> Optional[Dict[str, Any]]:
-    """Сырой запрос цены на крипту без кеша, с fallback"""
-    crypto_info = CRYPTO_IDS.get(symbol)
-    if not crypto_info:
+    info = CRYPTO_IDS.get(symbol)
+    if not info:
         return None
 
-    # 1. Binance
+    # 1. Binance primary
     try:
-        binance_symbol = crypto_info["binance"]
+        binance_symbol = info["binance"]
         url = "https://api.binance.com/api/v3/ticker/24hr"
         params = {"symbol": binance_symbol}
 
         print(f"🔍 Trying Binance for {symbol}...")
-
         async with session.get(url, params=params, timeout=TIMEOUT) as response:
             print(f"   Binance response status: {response.status}")
-
             if response.status != 200:
                 if response.status == 429:
-                    print(f"⚠️ Binance rate limit for {symbol} (1200/min exceeded)")
+                    print(f"⚠️ Binance rate limit for {symbol}")
                 elif response.status == 403:
-                    print(f"⚠️ Binance blocked for {symbol} (geo-block or firewall)")
+                    print(f"⚠️ Binance blocked for {symbol}")
                 elif response.status == 418:
                     print(f"⚠️ Binance IP ban for {symbol}")
                 else:
@@ -706,35 +705,32 @@ async def get_crypto_price_raw(session: aiohttp.ClientSession, symbol: str) -> O
             else:
                 data = await response.json()
                 price = float(data.get("lastPrice", 0))
-                change_24h = float(data.get("priceChangePercent", 0))
-
+                chg24 = float(data.get("priceChangePercent", 0))
                 if price > 0 and not math.isnan(price) and not math.isinf(price):
-                    print(f"✅ {symbol} from Binance: ${price:,.2f} ({change_24h:+.2f}%)")
+                    print(f"✅ {symbol} from Binance: ${price:,.2f} ({chg24:+.2f}%)")
                     return {
                         "usd": price,
-                        "change_24h": change_24h if not math.isnan(change_24h) else None,
-                        "source": "Binance"
+                        "change_24h": chg24 if not math.isnan(chg24) else None,
+                        "source": "Binance",
                     }
                 else:
-                    print(f"⚠️ Binance returned invalid price for {symbol}: {price}")
+                    print(f"⚠️ Binance invalid price for {symbol}: {price}")
     except asyncio.TimeoutError:
-        print(f"⚠️ Binance timeout for {symbol} (>{TIMEOUT.total}s)")
+        print(f"⚠️ Binance timeout for {symbol}")
     except aiohttp.ClientError as e:
         print(f"⚠️ Binance connection error for {symbol}: {e}")
     except Exception as e:
         print(f"⚠️ Binance failed for {symbol}: {type(e).__name__}: {e}")
 
-    # 2. CoinPaprika
+    # 2. CoinPaprika fallback
     try:
-        paprika_id = crypto_info["paprika"]
+        paprika_id = info["paprika"]
         url = f"https://api.coinpaprika.com/v1/tickers/{paprika_id}"
         data = await get_json(session, url, None)
-
         if data:
             quotes = data.get("quotes", {}).get("USD", {})
             price = quotes.get("price")
-            change_24h = quotes.get("percent_change_24h")
-
+            chg24 = quotes.get("percent_change_24h")
             if price:
                 try:
                     price = float(price)
@@ -742,30 +738,28 @@ async def get_crypto_price_raw(session: aiohttp.ClientSession, symbol: str) -> O
                         print(f"✅ {symbol} from CoinPaprika: ${price:,.2f}")
                         return {
                             "usd": price,
-                            "change_24h": float(change_24h) if change_24h and not math.isnan(float(change_24h)) else None,
-                            "source": "CoinPaprika"
+                            "change_24h": float(chg24) if chg24 and not math.isnan(float(chg24)) else None,
+                            "source": "CoinPaprika",
                         }
                 except (ValueError, TypeError):
                     pass
     except Exception as e:
         print(f"⚠️ CoinPaprika failed for {symbol}: {e}")
 
-    # 3. CoinGecko
+    # 3. CoinGecko last resort
     try:
-        coingecko_id = crypto_info["coingecko"]
+        gecko_id = info["coingecko"]
         url = "https://api.coingecko.com/api/v3/simple/price"
         params = {
-            "ids": coingecko_id,
+            "ids": gecko_id,
             "vs_currencies": "usd",
-            "include_24hr_change": "true"
+            "include_24hr_change": "true",
         }
         data = await get_json(session, url, params)
-
-        if data and coingecko_id in data:
-            coin_data = data[coingecko_id]
+        if data and gecko_id in data:
+            coin_data = data[gecko_id]
             price = coin_data.get("usd")
-            change_24h = coin_data.get("usd_24h_change")
-
+            chg24 = coin_data.get("usd_24h_change")
             if price:
                 try:
                     price = float(price)
@@ -773,8 +767,8 @@ async def get_crypto_price_raw(session: aiohttp.ClientSession, symbol: str) -> O
                         print(f"✅ {symbol} from CoinGecko: ${price:,.2f}")
                         return {
                             "usd": price,
-                            "change_24h": float(change_24h) if change_24h and not math.isnan(float(change_24h)) else None,
-                            "source": "CoinGecko"
+                            "change_24h": float(chg24) if chg24 and not math.isnan(float(chg24)) else None,
+                            "source": "CoinGecko",
                         }
                 except (ValueError, TypeError):
                     pass
@@ -784,8 +778,11 @@ async def get_crypto_price_raw(session: aiohttp.ClientSession, symbol: str) -> O
     print(f"❌ All sources failed for {symbol}")
     return None
 
+
 async def get_crypto_price(session: aiohttp.ClientSession, symbol: str, use_cache: bool = True) -> Optional[Dict[str, Any]]:
-    """Получить цену крипты с кешированием"""
+    """
+    Вернуть цену крипты с кешированием.
+    """
     cache_key = f"crypto_{symbol}"
 
     if use_cache:
@@ -795,111 +792,40 @@ async def get_crypto_price(session: aiohttp.ClientSession, symbol: str, use_cach
             return cached
 
     result = await get_crypto_price_raw(session, symbol)
-
     if result:
         price_cache.set(cache_key, result)
 
     return result
 
-async def get_fear_greed_index(session: aiohttp.ClientSession) -> Optional[int]:
-    """Индекс страха и жадности (крипторынок)"""
-    cache_key = "fear_greed"
 
+async def get_fear_greed_index(session: aiohttp.ClientSession) -> Optional[int]:
+    cache_key = "fear_greed"
     cached = price_cache.get(cache_key)
     if cached:
-        return cached.get('value')
+        return cached.get("value")
 
     try:
         url = "https://api.alternative.me/fng/"
         data = await get_json(session, url, None)
         if data and "data" in data:
             value = int(data["data"][0]["value"])
-            price_cache.set(cache_key, {'value': value})
+            price_cache.set(cache_key, {"value": value})
             return value
     except Exception as e:
         print(f"❌ Fear & Greed error: {e}")
     return None
 
-# ===========================
-# === PORTFOLIO / TRADING ===
-# ===========================
 
-def get_user_portfolio(user_id: int) -> Dict[str, float]:
-    """Получить портфель пользователя, с дефолтами для новых"""
-    if user_id not in user_portfolios:
-        user_portfolios[user_id] = {
-            "VWCE.DE": 0,
-            "DE000A2T5DZ1.SG": 0,
-            "BTC": 0,
-            "ETH": 0,
-            "SOL": 0,
-        }
-    return user_portfolios[user_id]
+# === MARKET SIGNALS ===
+INVESTOR_TYPES = {
+    "long": {"name": "Долгосрочный инвестор", "emoji": "🏔️", "desc": "Покупаю на страхе, держу годами"},
+    "swing": {"name": "Свинг-трейдер", "emoji": "🌊", "desc": "Ловлю волны, держу дни-недели"},
+    "day": {"name": "Дневной трейдер", "emoji": "⚡", "desc": "Быстрые сделки внутри дня"},
+}
 
-def get_all_active_assets() -> Dict[str, List[int]]:
-    """Собрать список активных тикеров по всем юзерам (для алертов)"""
-    active_assets: Dict[str, List[int]] = {}
-
-    # Портфели
-    for user_id, portfolio in user_portfolios.items():
-        for ticker, quantity in portfolio.items():
-            try:
-                if float(quantity) > 0:
-                    if ticker not in active_assets:
-                        active_assets[ticker] = []
-                    if user_id not in active_assets[ticker]:
-                        active_assets[ticker].append(user_id)
-            except (ValueError, TypeError):
-                continue
-
-    # Сделки
-    for user_id, trades in user_trades.items():
-        for trade in trades:
-            symbol = trade.get('symbol')
-            if symbol:
-                if symbol not in active_assets:
-                    active_assets[symbol] = []
-                if user_id not in active_assets[symbol]:
-                    active_assets[symbol].append(user_id)
-
-    return active_assets
-
-def get_user_trades(user_id: int) -> List[Dict[str, Any]]:
-    """Все сделки юзера"""
-    if user_id not in user_trades:
-        user_trades[user_id] = []
-    return user_trades[user_id]
-
-def add_trade(user_id: int, symbol: str, amount: float, entry_price: float, target_profit_pct: float):
-    """Добавить новую сделку (локально + Supabase async)"""
-    trades = get_user_trades(user_id)
-    trade = {
-        "symbol": symbol,
-        "amount": amount,
-        "entry_price": entry_price,
-        "target_profit_pct": target_profit_pct,
-        "timestamp": datetime.now().isoformat(),
-        "notified": False
-    }
-    trades.append(trade)
-    save_trades()  # локально (атомарно)
-    print(f"✅ Added trade for user {user_id}: {symbol} x{amount} @ ${entry_price}")
-
-    # В Supabase — не блокируя поток
-    try:
-        loop = asyncio.get_event_loop()
-        loop.create_task(supabase_storage.add_trade(
-            user_id, symbol, amount, entry_price, target_profit_pct
-        ))
-    except Exception as e:
-        print(f"⚠️ Supabase async add trade error: {e}")
-
-# ==========================
-# === SIGNALS / ANALYTIC ===
-# ==========================
 
 async def get_market_signal(session: aiohttp.ClientSession, symbol: str, investor_type: str) -> Dict[str, Any]:
-    """Получить сигнал BUY/HOLD/SELL по активу с учётом профиля инвестора"""
+    """Сформировать сигнал BUY/HOLD/SELL по монете, учитывая профиль пользователя."""
     crypto_data = await get_crypto_price(session, symbol)
     if not crypto_data:
         return {"signal": "UNKNOWN", "emoji": "❓", "reason": "Нет данных о цене"}
@@ -913,19 +839,19 @@ async def get_market_signal(session: aiohttp.ClientSession, symbol: str, investo
             return {
                 "signal": "BUY",
                 "emoji": "🟢",
-                "reason": f"Экстремальный страх ({fear_greed}/100). Отличная точка входа."
+                "reason": f"Экстремальный страх ({fear_greed}/100). Отличная точка входа.",
             }
         elif fear_greed > 75:
             return {
                 "signal": "HOLD",
                 "emoji": "🟡",
-                "reason": f"Жадность ({fear_greed}/100). Держите позиции."
+                "reason": f"Жадность ({fear_greed}/100). Держите позиции.",
             }
         else:
             return {
                 "signal": "HOLD",
                 "emoji": "🟡",
-                "reason": f"Стабильный рынок ({fear_greed}/100). Держать долгосрочно."
+                "reason": f"Стабильный рынок ({fear_greed}/100). Держать долгосрочно.",
             }
 
     elif investor_type == "swing":
@@ -933,19 +859,19 @@ async def get_market_signal(session: aiohttp.ClientSession, symbol: str, investo
             return {
                 "signal": "BUY",
                 "emoji": "🟢",
-                "reason": f"Страх ({fear_greed}/100). Возможность войти на коррекции."
+                "reason": f"Страх ({fear_greed}/100). Возможность войти на коррекции.",
             }
         elif fear_greed > 65:
             return {
                 "signal": "SELL",
                 "emoji": "🔴",
-                "reason": f"Жадность ({fear_greed}/100). Зафиксировать прибыль."
+                "reason": f"Жадность ({fear_greed}/100). Зафиксировать прибыль.",
             }
         else:
             return {
                 "signal": "HOLD",
                 "emoji": "🟡",
-                "reason": f"Нейтрально ({fear_greed}/100). Ждать лучшей точки."
+                "reason": f"Нейтрально ({fear_greed}/100). Ждать лучшей точки.",
             }
 
     else:  # day trader
@@ -953,36 +879,37 @@ async def get_market_signal(session: aiohttp.ClientSession, symbol: str, investo
             return {
                 "signal": "BUY",
                 "emoji": "🟢",
-                "reason": f"Страх ({fear_greed}/100). Возможен отскок."
+                "reason": f"Страх ({fear_greed}/100). Возможен отскок.",
             }
         elif fear_greed > 60:
             return {
                 "signal": "SELL",
                 "emoji": "🔴",
-                "reason": f"Перекупленность ({fear_greed}/100). Риск коррекции."
+                "reason": f"Перекупленность ({fear_greed}/100). Риск коррекции.",
             }
         else:
             return {
                 "signal": "HOLD",
                 "emoji": "🟡",
-                "reason": f"Флэт ({fear_greed}/100). Ожидание сигнала."
+                "reason": f"Флэт ({fear_greed}/100). Ожидание сигнала.",
             }
 
-# ======================================
-# === ALERTS: PRICE + TRADE PROFIT   ===
-# ======================================
 
+# === ALERTS (проверка изменения цен и достижения целей по сделкам) ===
 async def check_all_alerts(context: ContextTypes.DEFAULT_TYPE):
-    """Единая проверка алертов (цены и достижение целей по сделкам)"""
+    """
+    Проверяем:
+    - сильные движения цены по активам пользователей (stocks/crypto)
+    - сделки, у которых достигнута целевая прибыль.
+    """
     if not CHAT_ID:
-        print("⚠️ CHAT_ID not set, skipping alerts")
+        print("⚠️ CHAT_ID not set, skipping alerts broadcast")
         return
 
     print("🔔 Running optimized alerts check...")
 
     try:
         active_assets = get_all_active_assets()
-
         if not active_assets:
             print("ℹ️  No active assets, skipping alerts")
             return
@@ -996,22 +923,20 @@ async def check_all_alerts(context: ContextTypes.DEFAULT_TYPE):
             trade_alerts: Dict[int, List[str]] = {}
 
             for asset, user_ids in active_assets.items():
-                # Акции / ETF
+                # Акции / ETF (Yahoo)
                 if asset in AVAILABLE_TICKERS:
                     price_data = await get_yahoo_price(session, asset)
                     if not price_data:
-                        print(f"  ⚠️ {asset}: No price data available")
+                        print(f"  ⚠️ {asset}: No price data")
                         continue
-
                     price, currency, _ = price_data
                     cache_key = f"alert_stock_{asset}"
-                    old_price = price_cache.get_for_alert(cache_key)
 
+                    old_price = price_cache.get_for_alert(cache_key)
                     if old_price and old_price > 0:
                         try:
                             change_pct = ((price - old_price) / old_price) * 100
                             print(f"  {asset}: {old_price:.2f} -> {price:.2f} ({change_pct:+.2f}%)")
-
                             if abs(change_pct) >= THRESHOLDS["stocks"]:
                                 name = AVAILABLE_TICKERS[asset]["name"]
                                 emoji = "📈" if change_pct > 0 else "📉"
@@ -1019,15 +944,15 @@ async def check_all_alerts(context: ContextTypes.DEFAULT_TYPE):
                                     f"{emoji} <b>{name}</b>: {change_pct:+.2f}%\n"
                                     f"Цена: {price:.2f} {currency}"
                                 )
-                                print(f"  🚨 ALERT! {name} changed by {change_pct:+.2f}%")
+                                print(f"  🚨 ALERT! {name} {change_pct:+.2f}%")
                         except (ValueError, ZeroDivisionError) as e:
                             print(f"  ⚠️ {asset}: Calculation error - {e}")
                     else:
-                        print(f"  {asset}: First check, storing price {price:.2f}")
+                        print(f"  {asset}: First check, baseline {price:.2f}")
 
                     price_cache.set_for_alert(cache_key, price)
 
-                # Крипта
+                # Криптовалюты
                 elif asset in CRYPTO_IDS:
                     crypto_data = await get_crypto_price(session, asset, use_cache=False)
                     if not crypto_data:
@@ -1036,68 +961,70 @@ async def check_all_alerts(context: ContextTypes.DEFAULT_TYPE):
 
                     current_price = crypto_data["usd"]
                     cache_key = f"alert_crypto_{asset}"
-
-                    # Price alert
                     old_price = price_cache.get_for_alert(cache_key)
+
+                    # price movement alert
                     if old_price and old_price > 0:
                         try:
                             change_pct = ((current_price - old_price) / old_price) * 100
-                            print(f"  {asset}: ${old_price:,.2f} -> ${current_price:,.2f} ({change_pct:+.2f}%)")
-
+                            print(
+                                f"  {asset}: ${old_price:,.2f} -> ${current_price:,.2f} ({change_pct:+.2f}%)"
+                            )
                             if abs(change_pct) >= THRESHOLDS["crypto"]:
                                 emoji = "🚀" if change_pct > 0 else "⚠️"
                                 price_alerts.append(
                                     f"{emoji} <b>{asset}</b>: {change_pct:+.2f}%\n"
                                     f"Цена: ${current_price:,.2f}"
                                 )
-                                print(f"  🚨 PRICE ALERT! {asset} changed by {change_pct:+.2f}%")
+                                print(f"  🚨 PRICE ALERT! {asset} {change_pct:+.2f}%")
                         except (ValueError, ZeroDivisionError) as e:
                             print(f"  ⚠️ {asset}: Calculation error - {e}")
                     else:
-                        print(f"  {asset}: First check, storing price ${current_price:,.2f}")
+                        print(f"  {asset}: First check, baseline ${current_price:,.2f}")
 
                     price_cache.set_for_alert(cache_key, current_price)
 
-                    # Trade profit alerts (по юзерам у этого актива)
-                    for user_id in user_ids:
-                        trades = get_user_trades(user_id)
-
-                        for trade in trades:
-                            if trade.get("symbol") != asset or trade.get("notified", False):
+                    # target profit check по сделкам пользователей
+                    for uid in user_ids:
+                        trades_list = get_user_trades(uid)
+                        for tr in trades_list:
+                            if tr.get("symbol") != asset or tr.get("notified", False):
                                 continue
                             try:
-                                entry_price = float(trade["entry_price"])
-                                target = float(trade["target_profit_pct"])
-                                amount = float(trade["amount"])
+                                entry_price = float(tr["entry_price"])
+                                target_pct = float(tr["target_profit_pct"])
+                                amount = float(tr["amount"])
 
                                 if entry_price <= 0:
                                     continue
 
                                 profit_pct = ((current_price - entry_price) / entry_price) * 100
-                                print(f"  Trade check: {asset} for user {user_id}: {profit_pct:.2f}% (target {target}%)")
+                                print(
+                                    f"  Trade check: {asset} for user {uid}: {profit_pct:.2f}% "
+                                    f"(target {target_pct}%)"
+                                )
 
-                                if profit_pct >= target:
-                                    value = amount * current_price
-                                    profit_usd = amount * (current_price - entry_price)
+                                if profit_pct >= target_pct:
+                                    value_now = amount * current_price
+                                    profit_abs = amount * (current_price - entry_price)
 
-                                    alert_text = (
+                                    alert_msg = (
                                         f"🎯 <b>ЦЕЛЬ ДОСТИГНУТА!</b>\n\n"
                                         f"💰 {asset}\n"
                                         f"Количество: {amount:.4f}\n"
                                         f"Цена входа: ${entry_price:,.2f}\n"
                                         f"Текущая цена: ${current_price:,.2f}\n\n"
-                                        f"📈 Прибыль: <b>{profit_pct:.2f}%</b> (${profit_usd:,.2f})\n"
-                                        f"💵 Стоимость: ${value:,.2f}\n\n"
+                                        f"📈 Прибыль: <b>{profit_pct:.2f}%</b> "
+                                        f"(${profit_abs:,.2f})\n"
+                                        f"💵 Стоимость: ${value_now:,.2f}\n\n"
                                         f"✅ <b>Рекомендация: ПРОДАВАТЬ</b>"
                                     )
 
-                                    if user_id not in trade_alerts:
-                                        trade_alerts[user_id] = []
-                                    trade_alerts[user_id].append(alert_text)
-
-                                    # пометить сделку, чтобы не спамить повторно
-                                    trade["notified"] = True
-                                    print(f"  🚨 PROFIT ALERT for user {user_id}: {asset} +{profit_pct:.2f}%!")
+                                    if uid not in trade_alerts:
+                                        trade_alerts[uid] = []
+                                    trade_alerts[uid].append(alert_msg)
+                                    tr["notified"] = True
+                                    print(f"  🚨 PROFIT ALERT for user {uid}: {asset} +{profit_pct:.2f}%!")
 
                             except (ValueError, TypeError, KeyError, ZeroDivisionError) as e:
                                 print(f"  ⚠️ Trade processing error for {asset}: {e}")
@@ -1105,34 +1032,36 @@ async def check_all_alerts(context: ContextTypes.DEFAULT_TYPE):
 
                 await asyncio.sleep(0.2)
 
-            # Сохраняем факт, что трейды помечены notified
+            # Если мы обновляли notified — сохранить локально
             if trade_alerts:
-                save_trades()
+                save_trades_local()
 
-            # Сохраняем кеш
+            # Сохранить кеш цен
             price_cache.save()
 
-            # Отправляем price alerts в общий канал (CHAT_ID)
+            # Отправить price alerts в общий канал CHAT_ID
             if price_alerts:
-                message = "🔔 <b>Ценовые алерты!</b>\n\n" + "\n\n".join(price_alerts)
-                await context.bot.send_message(chat_id=CHAT_ID, text=message, parse_mode='HTML')
+                msg = "🔔 <b>Ценовые алерты!</b>\n\n" + "\n\n".join(price_alerts)
+                await context.bot.send_message(chat_id=CHAT_ID, text=msg, parse_mode="HTML")
                 print(f"📤 Sent {len(price_alerts)} price alerts")
 
-            # Отправляем trade alerts каждому юзеру персонально
-            total_trade_alerts = sum(len(alerts) for alerts in trade_alerts.values())
-            for user_id, alerts in trade_alerts.items():
-                for alert in alerts:
+            # Отправить trade alerts по юзерам индивидуально
+            total_trade_alerts = sum(len(v) for v in trade_alerts.values())
+            for uid, alerts in trade_alerts.items():
+                for text_msg in alerts:
                     try:
-                        await context.bot.send_message(chat_id=str(user_id), text=alert, parse_mode='HTML')
+                        await context.bot.send_message(chat_id=str(uid), text=text_msg, parse_mode="HTML")
                     except Exception as e:
-                        print(f"⚠️ Failed to send alert to user {user_id}: {e}")
+                        print(f"⚠️ Failed to send alert to user {uid}: {e}")
 
             if total_trade_alerts:
-                print(f"📤 Sent {total_trade_alerts} trade alerts to {len(trade_alerts)} users")
+                print(
+                    f"📤 Sent {total_trade_alerts} trade alerts to {len(trade_alerts)} users"
+                )
 
+            # Лог статистики кеша
             cache_stats = price_cache.get_stats()
             print(f"📊 Cache stats: {cache_stats}")
-
             print(
                 f"✅ Alerts check complete. Active assets: {len(active_assets)}, "
                 f"Price alerts: {len(price_alerts)}, Trade alerts: {total_trade_alerts}"
@@ -1144,15 +1073,23 @@ async def check_all_alerts(context: ContextTypes.DEFAULT_TYPE):
         print(f"❌ check_all_alerts error: {e}")
         traceback.print_exc()
 
-# =======================
-# === BOT COMMANDS  ====
-# =======================
+
+# === TELEGRAM HANDLERS ===
+def get_main_menu():
+    keyboard = [
+        [KeyboardButton("💼 Мой портфель"), KeyboardButton("💹 Все цены")],
+        [KeyboardButton("🎯 Мои сделки"), KeyboardButton("📊 Рыночные сигналы")],
+        [KeyboardButton("📰 События недели"), KeyboardButton("🔮 Прогнозы")],
+        [KeyboardButton("➕ Добавить актив"), KeyboardButton("🆕 Новая сделка")],
+        [KeyboardButton("👤 Мой профиль"), KeyboardButton("ℹ️ Помощь")],
+    ]
+    return ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
+
 
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-
-    if user_id not in user_profiles:
-        user_profiles[user_id] = "long"
+    uid = update.effective_user.id
+    if uid not in user_profiles:
+        user_profiles[uid] = "long"
 
     await update.message.reply_text(
         "👋 <b>Оптимизированный Trading Bot v5-FIXED</b>\n\n"
@@ -1164,36 +1101,35 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "• ✅ Graceful shutdown\n\n"
         "<b>⚡ ОПТИМИЗАЦИИ:</b>\n"
         "• Проверка только активных позиций\n"
-        "• Персистентное хранение (Supabase + локально)\n"
+        "• Персистентное хранение\n"
         "• Умное кеширование (TTL 5 мин)\n"
         "• Приоритет Binance API\n"
-        "• Снижение внешних запросов\n\n"
+        "• Меньше внешних запросов\n\n"
         "<b>📊 ФУНКЦИИ:</b>\n"
         "• 💼 Портфель (акции + крипта)\n"
         "• 🎯 Сделки с целевой прибылью\n"
         "• 📊 Рыночные сигналы BUY/HOLD/SELL\n"
         "• 🔔 Умные алерты\n\n"
         "Используй кнопки меню 👇",
-        parse_mode='HTML',
-        reply_markup=get_main_menu()
+        parse_mode="HTML",
+        reply_markup=get_main_menu(),
     )
 
+
 async def cmd_portfolio(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Показать портфель юзера с текущими оценками стоимости"""
-    user_id = update.effective_user.id
-    portfolio = get_user_portfolio(user_id)
+    uid = update.effective_user.id
+    portfolio = get_user_portfolio(uid)
 
     if not portfolio or all(v == 0 for v in portfolio.values()):
         await update.message.reply_text(
-            "💼 Ваш портфель пуст!\n\n"
-            "Используйте <b>➕ Добавить актив</b>",
-            parse_mode='HTML'
+            "💼 Ваш портфель пуст!\n\nИспользуйте <b>➕ Добавить актив</b>",
+            parse_mode="HTML",
         )
         return
 
     try:
-        lines: List[str] = ["💼 <b>Ваш портфель:</b>\n"]
-        total_value_usd = 0
+        lines = ["💼 <b>Ваш портфель:</b>\n"]
+        total_value_usd = 0.0
 
         async with aiohttp.ClientSession() as session:
             # Акции / ETF
@@ -1204,27 +1140,26 @@ async def cmd_portfolio(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 lines.append("Актив          Кол-во    Цена        Сумма")
                 lines.append("─" * 50)
 
-                for ticker, quantity in stock_items:
-                    if quantity == 0:
+                for ticker, qty in stock_items:
+                    if qty == 0:
                         continue
-
                     price_data = await get_yahoo_price(session, ticker)
                     if price_data:
                         price, cur, _ = price_data
-                        value = price * quantity
+                        value = price * qty
 
-                        name = AVAILABLE_TICKERS[ticker]['name'][:14].ljust(14)
-                        qty_str = f"{quantity:.2f}".rjust(8)
+                        name = AVAILABLE_TICKERS[ticker]["name"][:14].ljust(14)
+                        qty_str = f"{qty:.2f}".rjust(8)
                         price_str = f"{price:.2f}".rjust(8)
                         value_str = f"{value:.2f} {cur}".rjust(12)
 
                         lines.append(f"{name} {qty_str} {price_str} {value_str}")
 
-                        # грубая конверсия в USD если EUR
+                        # грубая конверсия EUR->USD если нужно
                         if cur == "USD":
                             total_value_usd += value
                         elif cur == "EUR":
-                            total_value_usd += value * 1.1  # упрощённый курс
+                            total_value_usd += value * 1.1
 
                     await asyncio.sleep(0.3)
 
@@ -1238,23 +1173,23 @@ async def cmd_portfolio(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 lines.append("Монета    Кол-во      Цена          Сумма")
                 lines.append("─" * 50)
 
-                for symbol, quantity in crypto_items:
-                    if quantity == 0:
+                for symbol, qty in crypto_items:
+                    if qty == 0:
                         continue
 
                     crypto_data = await get_crypto_price(session, symbol)
                     if crypto_data:
                         price = crypto_data["usd"]
                         chg = crypto_data.get("change_24h")
-                        value = price * quantity
+                        value = price * qty
                         total_value_usd += value
 
                         sym_str = symbol.ljust(9)
-                        qty_str = f"{quantity:.4f}".rjust(10)
+                        qty_str = f"{qty:.4f}".rjust(10)
                         price_str = f"${price:,.2f}".rjust(12)
                         value_str = f"${value:,.2f}".rjust(12)
 
-                        chg_emoji = "📈" if chg and chg >= 0 else "📉" if chg else ""
+                        chg_emoji = "📈" if chg and chg >= 0 else ("📉" if chg else "")
                         lines.append(f"{sym_str} {qty_str} {price_str} {value_str} {chg_emoji}")
 
                     await asyncio.sleep(0.2)
@@ -1264,27 +1199,28 @@ async def cmd_portfolio(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if total_value_usd > 0:
             lines.append(f"\n<b>💰 Общая стоимость: ~${total_value_usd:,.2f}</b>")
 
-        await update.message.reply_text("\n".join(lines), parse_mode='HTML')
+        await update.message.reply_text("\n".join(lines), parse_mode="HTML")
 
     except Exception as e:
         print(f"❌ portfolio error: {e}")
         traceback.print_exc()
         await update.message.reply_text("⚠ Ошибка при получении данных")
 
+
 async def cmd_all_prices(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Показать текущие цены всех отслеживаемых тикеров"""
+    """Показать все цены по доступным активам."""
     try:
-        # корректное локальное время Риги
-        now = datetime.now(ZoneInfo("Europe/Riga"))
+        riga_tz = timezone(timedelta(hours=2))  # упрощенно "Рига"
+        now = datetime.now(riga_tz)
         timestamp = now.strftime("%H:%M:%S %d.%m.%Y")
 
-        lines: List[str] = [
-            f"💹 <b>Все цены</b>\n",
-            f"🕐 Данные: <b>{timestamp}</b> (Рига)\n"
+        lines = [
+            "💹 <b>Все цены</b>\n",
+            f"🕐 Данные: <b>{timestamp}</b> (Рига)\n",
         ]
 
         async with aiohttp.ClientSession() as session:
-            # Акции / ETF
+            # Фондовый рынок
             lines.append("<b>📊 Фондовый рынок:</b>")
             lines.append("<pre>")
             lines.append("┌──────────────────┬────────────┬─────────┐")
@@ -1295,20 +1231,19 @@ async def cmd_all_prices(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 price_data = await get_yahoo_price(session, ticker)
                 if price_data:
                     price, cur, change_pct = price_data
-                    name = info['name'][:16].ljust(16)
+                    name = info["name"][:16].ljust(16)
                     price_str = f"{price:.2f} {cur}".ljust(10)
-
                     if change_pct != 0:
                         chg_emoji = "↗" if change_pct >= 0 else "↘"
                         chg_str = f"{chg_emoji}{abs(change_pct):.1f}%".rjust(7)
                     else:
                         chg_str = "0.0%".rjust(7)
-
                     lines.append(f"│ {name} │ {price_str} │ {chg_str} │")
                 else:
-                    name = info['name'][:16].ljust(16)
-                    lines.append(f"│ {name} │ {'н/д'.ljust(10)} │ {'N/A'.rjust(7)} │")
-
+                    name = info["name"][:16].ljust(16)
+                    lines.append(
+                        f"│ {name} │ {'н/д'.ljust(10)} │ {'N/A'.rjust(7)} │"
+                    )
                 await asyncio.sleep(0.3)
 
             lines.append("└──────────────────┴────────────┴─────────┘")
@@ -1327,67 +1262,69 @@ async def cmd_all_prices(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     if crypto_data:
                         price = crypto_data["usd"]
                         chg = crypto_data.get("change_24h")
-                        source = crypto_data.get("source", "Unknown")[:8]
+                        src = crypto_data.get("source", "Unknown")[:8]
 
                         sym_str = symbol.ljust(6)
                         price_str = f"${price:,.2f}".ljust(12)
-
                         if chg is not None and not math.isnan(chg):
                             chg_emoji = "↗" if chg >= 0 else "↘"
                             chg_str = f"{chg_emoji}{abs(chg):.1f}%".rjust(7)
                         else:
                             chg_str = "N/A".rjust(7)
 
-                        lines.append(f"│ {sym_str} │ {price_str} │ {chg_str} │ {source.ljust(8)} │")
+                        lines.append(
+                            f"│ {sym_str} │ {price_str} │ {chg_str} │ {src.ljust(8)} │"
+                        )
                     else:
                         sym_str = symbol.ljust(6)
-                        lines.append(f"│ {sym_str} │ {'н/д'.ljust(12)} │ {'N/A'.rjust(7)} │ {'—'.ljust(8)} │")
-
+                        lines.append(
+                            f"│ {sym_str} │ {'н/д'.ljust(12)} │ {'N/A'.rjust(7)} │ {'—'.ljust(8)} │"
+                        )
                 except Exception as e:
                     print(f"❌ {symbol} price error: {e}")
                     sym_str = symbol.ljust(6)
-                    lines.append(f"│ {sym_str} │ {'ошибка'.ljust(12)} │ {'N/A'.rjust(7)} │ {'—'.ljust(8)} │")
-
+                    lines.append(
+                        f"│ {sym_str} │ {'ошибка'.ljust(12)} │ {'N/A'.rjust(7)} │ {'—'.ljust(8)} │"
+                    )
                 await asyncio.sleep(0.2)
 
             lines.append("└────────┴──────────────┴─────────┴──────────┘")
             lines.append("</pre>")
 
-        await update.message.reply_text("\n".join(lines), parse_mode='HTML')
+        await update.message.reply_text("\n".join(lines), parse_mode="HTML")
 
     except Exception as e:
         print(f"❌ all_prices error: {e}")
         traceback.print_exc()
         await update.message.reply_text("⚠ Ошибка при получении данных")
 
-async def cmd_my_trades(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Показать активные сделки пользователя"""
-    user_id = update.effective_user.id
-    trades = get_user_trades(user_id)
 
-    if not trades:
+async def cmd_my_trades(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id
+    trades_list = get_user_trades(uid)
+
+    if not trades_list:
         await update.message.reply_text(
             "🎯 У вас нет открытых сделок\n\n"
             "Используйте <b>🆕 Новая сделка</b>",
-            parse_mode='HTML'
+            parse_mode="HTML",
         )
         return
 
     try:
         await update.message.reply_text("🔄 Обновляю данные...")
 
-        lines: List[str] = ["🎯 <b>Ваши сделки:</b>\n"]
-
+        lines = ["🎯 <b>Ваши сделки:</b>\n"]
         async with aiohttp.ClientSession() as session:
             total_value = 0.0
             total_profit = 0.0
 
-            for i, trade in enumerate(trades, 1):
+            for i, trade in enumerate(trades_list, 1):
                 try:
                     symbol = trade["symbol"]
                     entry_price = float(trade["entry_price"])
                     amount = float(trade["amount"])
-                    target = float(trade["target_profit_pct"])
+                    target_pct = float(trade["target_profit_pct"])
                 except (KeyError, ValueError, TypeError) as e:
                     print(f"⚠️ Invalid trade data: {e}")
                     continue
@@ -1395,16 +1332,15 @@ async def cmd_my_trades(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 crypto_data = await get_crypto_price(session, symbol)
                 if crypto_data:
                     current_price = crypto_data["usd"]
-
                     if entry_price > 0:
                         profit_pct = ((current_price - entry_price) / entry_price) * 100
-                        profit_usd = amount * (current_price - entry_price)
-                        value = amount * current_price
+                        profit_abs = amount * (current_price - entry_price)
+                        value_now = amount * current_price
 
-                        total_value += value
-                        total_profit += profit_usd
+                        total_value += value_now
+                        total_profit += profit_abs
 
-                        if profit_pct >= target:
+                        if profit_pct >= target_pct:
                             status = "✅ ЦЕЛЬ"
                         elif profit_pct > 0:
                             status = "📈 ПРИБЫЛЬ"
@@ -1413,10 +1349,16 @@ async def cmd_my_trades(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
                         lines.append(f"{status} <b>#{i}. {symbol}</b>")
                         lines.append(f"├ Кол-во: {amount:.4f}")
-                        lines.append(f"├ Вход: ${entry_price:,.2f} → Сейчас: ${current_price:,.2f}")
-                        lines.append(f"├ Прибыль: <b>{profit_pct:+.2f}%</b> (${profit_usd:+,.2f})")
-                        lines.append(f"├ Цель: {target}% {'✅' if profit_pct >= target else '⏳'}")
-                        lines.append(f"└ Стоимость: ${value:,.2f}\n")
+                        lines.append(
+                            f"├ Вход: ${entry_price:,.2f} → Сейчас: ${current_price:,.2f}"
+                        )
+                        lines.append(
+                            f"├ Прибыль: <b>{profit_pct:+.2f}%</b> (${profit_abs:+,.2f})"
+                        )
+                        lines.append(
+                            f"├ Цель: {target_pct}% {'✅' if profit_pct >= target_pct else '⏳'}"
+                        )
+                        lines.append(f"└ Стоимость: ${value_now:,.2f}\n")
 
                 await asyncio.sleep(0.2)
 
@@ -1425,28 +1367,35 @@ async def cmd_my_trades(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 if initial_value > 0:
                     total_profit_pct = (total_profit / initial_value) * 100
                     lines.append("━━━━━━━━━━━━━━━━")
-                    lines.append(f"💰 <b>Общая стоимость: ${total_value:,.2f}</b>")
-                    lines.append(f"📊 <b>Общая прибыль: {total_profit_pct:+.2f}% (${total_profit:+,.2f})</b>")
+                    lines.append(
+                        f"💰 <b>Общая стоимость: ${total_value:,.2f}</b>"
+                    )
+                    lines.append(
+                        f"📊 <b>Общая прибыль: {total_profit_pct:+.2f}% "
+                        f"(${total_profit:+,.2f})</b>"
+                    )
 
-        await update.message.reply_text("\n".join(lines), parse_mode='HTML')
+        await update.message.reply_text("\n".join(lines), parse_mode="HTML")
 
     except Exception as e:
         print(f"❌ my_trades error: {e}")
         traceback.print_exc()
         await update.message.reply_text("⚠ Ошибка при получении данных")
 
-async def cmd_market_signals(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Адаптированные под профиль сигналы"""
-    user_id = update.effective_user.id
-    investor_type = user_profiles.get(user_id, "long")
-    type_info = INVESTOR_TYPES[investor_type]
 
-    await update.message.reply_text(f"🔄 Анализирую рынок для {type_info['emoji']} {type_info['name']}...")
+async def cmd_market_signals(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id
+    inv_type = user_profiles.get(uid, "long")
+    inv_info = INVESTOR_TYPES[inv_type]
+
+    await update.message.reply_text(
+        f"🔄 Анализирую рынок для {inv_info['emoji']} {inv_info['name']}..."
+    )
 
     try:
-        lines: List[str] = [
-            f"📊 <b>Рыночные сигналы</b>\n",
-            f"Профиль: {type_info['emoji']} <b>{type_info['name']}</b>\n"
+        lines = [
+            "📊 <b>Рыночные сигналы</b>\n",
+            f"Профиль: {inv_info['emoji']} <b>{inv_info['name']}</b>\n",
         ]
 
         async with aiohttp.ClientSession() as session:
@@ -1463,35 +1412,41 @@ async def cmd_market_signals(update: Update, context: ContextTypes.DEFAULT_TYPE)
                 else:
                     fg_status = "🤑 Экстремальная жадность"
 
-                lines.append(f"📈 Fear & Greed: <b>{fear_greed}/100</b> ({fg_status})\n")
+                lines.append(
+                    f"📈 Fear & Greed: <b>{fear_greed}/100</b> ({fg_status})\n"
+                )
 
             for symbol in ["BTC", "ETH", "SOL", "AVAX"]:
-                signal_data = await get_market_signal(session, symbol, investor_type)
-                lines.append(f"{signal_data['emoji']} <b>{symbol}: {signal_data['signal']}</b>")
-                lines.append(f"   └ {signal_data['reason']}\n")
+                sig = await get_market_signal(session, symbol, inv_type)
+                lines.append(f"{sig['emoji']} <b>{symbol}: {sig['signal']}</b>")
+                lines.append(f"   └ {sig['reason']}\n")
                 await asyncio.sleep(0.2)
 
         lines.append("\n<i>⚠️ Не является финансовой рекомендацией</i>")
 
-        await update.message.reply_text("\n".join(lines), parse_mode='HTML')
+        await update.message.reply_text("\n".join(lines), parse_mode="HTML")
 
     except Exception as e:
         print(f"❌ market_signals error: {e}")
         traceback.print_exc()
         await update.message.reply_text("⚠ Ошибка при получении сигналов")
 
+
 async def cmd_profile(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Профиль инвестора (long / swing / day)"""
-    user_id = update.effective_user.id
-    current_type = user_profiles.get(user_id, "long")
+    uid = update.effective_user.id
+    current_type = user_profiles.get(uid, "long")
 
     keyboard = []
-    for type_key, type_info in INVESTOR_TYPES.items():
-        selected = "✅ " if type_key == current_type else ""
-        keyboard.append([InlineKeyboardButton(
-            f"{selected}{type_info['emoji']} {type_info['name']}",
-            callback_data=f"profile_{type_key}"
-        )])
+    for t_key, t_info in INVESTOR_TYPES.items():
+        selected = "✅ " if t_key == current_type else ""
+        keyboard.append(
+            [
+                InlineKeyboardButton(
+                    f"{selected}{t_info['emoji']} {t_info['name']}",
+                    callback_data=f"profile_{t_key}",
+                )
+            ]
+        )
 
     reply_markup = InlineKeyboardMarkup(keyboard)
     current_info = INVESTOR_TYPES[current_type]
@@ -1501,70 +1456,75 @@ async def cmd_profile(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"Текущий: {current_info['emoji']} <b>{current_info['name']}</b>\n"
         f"<i>{current_info['desc']}</i>\n\n"
         f"Выберите тип для персонализированных сигналов:",
-        parse_mode='HTML',
-        reply_markup=reply_markup
+        parse_mode="HTML",
+        reply_markup=reply_markup,
     )
 
+
 async def profile_select(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Обработка нажатия на кнопку смены профиля"""
     query = update.callback_query
     await query.answer()
 
-    investor_type = query.data.replace("profile_", "")
-    user_id = query.from_user.id
-    user_profiles[user_id] = investor_type
+    inv_type = query.data.replace("profile_", "")
+    uid = query.from_user.id
+    user_profiles[uid] = inv_type
 
-    type_info = INVESTOR_TYPES[investor_type]
+    info = INVESTOR_TYPES[inv_type]
 
     await query.edit_message_text(
         f"✅ <b>Профиль обновлён!</b>\n\n"
-        f"{type_info['emoji']} <b>{type_info['name']}</b>\n"
-        f"<i>{type_info['desc']}</i>\n\n"
+        f"{info['emoji']} <b>{info['name']}</b>\n"
+        f"<i>{info['desc']}</i>\n\n"
         f"Теперь рыночные сигналы адаптированы под ваш стиль!",
-        parse_mode='HTML'
+        parse_mode="HTML",
     )
 
+
 async def cmd_events(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """События недели (пока статично, как демо)"""
+    """События недели — статический блок, можно потом сделать динамическим."""
     try:
         lines = ["📰 <b>События на неделю</b>\n"]
 
         lines.append("<b>📊 Фондовый рынок:</b>\n")
         lines.append(f"<b>• 02.11 - FOMC заседание ФРС</b>")
-        lines.append(f"  ℹ️ Решение по процентной ставке")
-        lines.append(f"  📉 Влияние: Повышение → давление на акции\n")
+        lines.append("  ℹ️ Решение по процентной ставке")
+        lines.append("  📉 Повышение → давление на акции\n")
 
         lines.append(f"<b>• 03.11 - Earnings reports</b>")
-        lines.append(f"  ℹ️ Apple, Microsoft, Google")
-        lines.append(f"  📈 Хорошие отчёты → рост SPY, VWCE\n")
+        lines.append("  ℹ️ Apple, Microsoft, Google")
+        lines.append("  📈 Хорошие отчёты → рост SPY, VWCE\n")
 
         lines.append("<b>₿ Криптовалюты:</b>\n")
         lines.append(f"<b>• 02.11 - Bitcoin ETF решение SEC</b>")
-        lines.append(f"  🚀 Одобрение → BTC +10-20%\n")
+        lines.append("  🚀 Одобрение → BTC +10-20%\n")
 
         lines.append(f"<b>• 04.11 - Ethereum Dencun upgrade</b>")
-        lines.append(f"  📈 ETH обычно растёт перед upgrade\n")
+        lines.append("  📈 ETH обычно растёт перед upgrade\n")
 
-        await update.message.reply_text("\n".join(lines), parse_mode='HTML')
+        await update.message.reply_text("\n".join(lines), parse_mode="HTML")
 
     except Exception as e:
         print(f"❌ events error: {e}")
         await update.message.reply_text("⚠ Ошибка")
 
+
 async def cmd_forecast(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Прогнозы - сейчас больше как заглушка"""
     await update.message.reply_text(
         "🔮 <b>Прогнозы</b>\n\n"
         "Используйте 📊 <b>Рыночные сигналы</b> для персонализированных рекомендаций!",
-        parse_mode='HTML'
+        parse_mode="HTML",
     )
 
+
 async def cmd_add(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Быстро добавить актив по команде /add TICKER КОЛ-ВО"""
+    """
+    Быстрая команда: /add TICKER КОЛ-ВО
+    Пример: /add BTC 0.05
+    """
     if len(context.args) != 2:
         await update.message.reply_text(
             "❌ Формат: <code>/add TICKER КОЛИЧЕСТВО</code>",
-            parse_mode='HTML'
+            parse_mode="HTML",
         )
         return
 
@@ -1579,78 +1539,84 @@ async def cmd_add(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if ticker not in AVAILABLE_TICKERS and ticker not in CRYPTO_IDS:
         await update.message.reply_text(
-            f"❌ Неизвестный тикер: {ticker}\n\n"
-            "Доступные: VWCE.DE, 4GLD.DE, DE000A2T5DZ1.SG, SPY, BTC, ETH, SOL, AVAX, DOGE, LINK"
+            "❌ Неизвестный тикер: {0}\n\n"
+            "Доступные: VWCE.DE, 4GLD.DE, DE000A2T5DZ1.SG, SPY, BTC, ETH, SOL, AVAX, DOGE, LINK".format(
+                ticker
+            )
         )
         return
 
-    user_id = update.effective_user.id
-    portfolio = get_user_portfolio(user_id)
+    uid = update.effective_user.id
+    portfolio = get_user_portfolio(uid)
     portfolio[ticker] = portfolio.get(ticker, 0) + quantity
-    save_portfolio(user_id, portfolio)
+    save_portfolio(uid, portfolio)
 
     name = AVAILABLE_TICKERS.get(ticker, {}).get("name") or CRYPTO_IDS.get(ticker, {}).get("name") or ticker
-
     await update.message.reply_text(
         f"✅ Добавлено: <b>{quantity} {name}</b>\n"
         f"Теперь у вас: {portfolio[ticker]:.4f}",
-        parse_mode='HTML'
+        parse_mode="HTML",
     )
 
-# ================================
-# === CONVERSATION: ADD ASSET  ===
-# ================================
+
+# === Conversation: Добавление актива через кнопки ===
+SELECT_ASSET_TYPE, SELECT_ASSET, ENTER_ASSET_AMOUNT = range(3)
+SELECT_CRYPTO, ENTER_AMOUNT, ENTER_PRICE, ENTER_TARGET = range(3, 7)
+
 
 async def cmd_add_asset(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Начало сценария добавления актива с кнопками"""
     keyboard = [
         [InlineKeyboardButton("📊 Акции / ETF", callback_data="asset_stocks")],
         [InlineKeyboardButton("₿ Криптовалюты", callback_data="asset_crypto")],
     ]
-    reply_markup = InlineKeyboardMarkup(keyboard)
-
     await update.message.reply_text(
         "➕ <b>Добавить актив</b>\n\nВыберите тип:",
-        parse_mode='HTML',
-        reply_markup=reply_markup
+        parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup(keyboard),
     )
     return SELECT_ASSET_TYPE
+
 
 async def add_asset_select_type(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
 
     asset_type = query.data.replace("asset_", "")
-    context.user_data['asset_type'] = asset_type
+    context.user_data["asset_type"] = asset_type
 
     keyboard = []
 
     if asset_type == "stocks":
-        context.user_data['asset_category'] = "stocks"
+        context.user_data["asset_category"] = "stocks"
         for ticker, info in AVAILABLE_TICKERS.items():
-            keyboard.append([InlineKeyboardButton(
-                f"{info['name']} ({ticker})",
-                callback_data=f"addticker_{ticker}"
-            )])
+            keyboard.append(
+                [
+                    InlineKeyboardButton(
+                        f"{info['name']} ({ticker})", callback_data=f"addticker_{ticker}"
+                    )
+                ]
+            )
     else:
-        context.user_data['asset_category'] = "crypto"
+        context.user_data["asset_category"] = "crypto"
         for symbol, info in CRYPTO_IDS.items():
-            keyboard.append([InlineKeyboardButton(
-                f"{info['name']} ({symbol})",
-                callback_data=f"addcrypto_{symbol}"
-            )])
-
-    reply_markup = InlineKeyboardMarkup(keyboard)
+            keyboard.append(
+                [
+                    InlineKeyboardButton(
+                        f"{info['name']} ({symbol})", callback_data=f"addcrypto_{symbol}"
+                    )
+                ]
+            )
 
     type_emoji = "📊" if asset_type == "stocks" else "₿"
     type_name = "Акции / ETF" if asset_type == "stocks" else "Криптовалюты"
 
     await query.edit_message_text(
         f"{type_emoji} <b>{type_name}</b>\n\nВыберите актив:",
-        parse_mode='HTML',
-        reply_markup=reply_markup
+        parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup(keyboard),
     )
     return SELECT_ASSET
+
 
 async def add_asset_select_item(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -1658,21 +1624,22 @@ async def add_asset_select_item(update: Update, context: ContextTypes.DEFAULT_TY
 
     if query.data.startswith("addticker_"):
         ticker = query.data.replace("addticker_", "")
-        context.user_data['selected_asset'] = ticker
-        name = AVAILABLE_TICKERS[ticker]['name']
+        context.user_data["selected_asset"] = ticker
+        name = AVAILABLE_TICKERS[ticker]["name"]
         emoji = "📊"
     else:
         symbol = query.data.replace("addcrypto_", "")
-        context.user_data['selected_asset'] = symbol
-        name = CRYPTO_IDS[symbol]['name']
+        context.user_data["selected_asset"] = symbol
+        name = CRYPTO_IDS[symbol]["name"]
         emoji = "₿"
 
     await query.edit_message_text(
         f"✅ Выбрано: {emoji} <b>{name}</b>\n\n"
         f"Введите количество:",
-        parse_mode='HTML'
+        parse_mode="HTML",
     )
     return ENTER_ASSET_AMOUNT
+
 
 async def add_asset_enter_amount(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
@@ -1680,21 +1647,21 @@ async def add_asset_enter_amount(update: Update, context: ContextTypes.DEFAULT_T
         if amount <= 0:
             raise ValueError()
 
-        user_id = update.effective_user.id
-        asset = context.user_data['selected_asset']
-        asset_category = context.user_data['asset_category']
+        uid = update.effective_user.id
+        asset = context.user_data["selected_asset"]
+        category = context.user_data["asset_category"]
 
-        if asset_category == "stocks":
-            name = AVAILABLE_TICKERS[asset]['name']
+        if category == "stocks":
+            name = AVAILABLE_TICKERS[asset]["name"]
             emoji = "📊"
         else:
-            name = CRYPTO_IDS[asset]['name']
+            name = CRYPTO_IDS[asset]["name"]
             emoji = "₿"
 
-        portfolio = get_user_portfolio(user_id)
+        portfolio = get_user_portfolio(uid)
         old_amount = portfolio.get(asset, 0)
         portfolio[asset] = old_amount + amount
-        save_portfolio(user_id, portfolio)
+        save_portfolio(uid, portfolio)
 
         await update.message.reply_text(
             f"✅ <b>Добавлено!</b>\n\n"
@@ -1702,8 +1669,8 @@ async def add_asset_enter_amount(update: Update, context: ContextTypes.DEFAULT_T
             f"Добавлено: {amount:.4f}\n"
             f"Было: {old_amount:.4f}\n"
             f"Стало: {portfolio[asset]:.4f}",
-            parse_mode='HTML',
-            reply_markup=get_main_menu()
+            parse_mode="HTML",
+            reply_markup=get_main_menu(),
         )
 
         context.user_data.clear()
@@ -1712,55 +1679,56 @@ async def add_asset_enter_amount(update: Update, context: ContextTypes.DEFAULT_T
     except Exception:
         await update.message.reply_text(
             "❌ Введите число\nНапример: <code>10</code> или <code>0.5</code>",
-            parse_mode='HTML'
+            parse_mode="HTML",
         )
         return ENTER_ASSET_AMOUNT
+
 
 async def add_asset_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("❌ Отменено", reply_markup=get_main_menu())
     context.user_data.clear()
     return ConversationHandler.END
 
-# ==================================
-# === CONVERSATION: NEW TRADE    ===
-# ==================================
 
+# === Conversation: Новая сделка с таргетом ===
 async def cmd_new_trade(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Начать создание новой сделки с выбором монеты"""
     keyboard = []
     for symbol in CRYPTO_IDS.keys():
-        name = CRYPTO_IDS[symbol]['name']
-        keyboard.append([InlineKeyboardButton(f"{name} ({symbol})", callback_data=f"trade_{symbol}")])
+        name = CRYPTO_IDS[symbol]["name"]
+        keyboard.append(
+            [InlineKeyboardButton(f"{name} ({symbol})", callback_data=f"trade_{symbol}")]
+        )
 
-    reply_markup = InlineKeyboardMarkup(keyboard)
     await update.message.reply_text(
         "🆕 <b>Новая сделка</b>\n\nВыберите криптовалюту:",
-        parse_mode='HTML',
-        reply_markup=reply_markup
+        parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup(keyboard),
     )
     return SELECT_CRYPTO
+
 
 async def trade_select_crypto(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
 
     symbol = query.data.replace("trade_", "")
-    context.user_data['trade_symbol'] = symbol
+    context.user_data["trade_symbol"] = symbol
 
     await query.edit_message_text(
         f"✅ Выбрано: <b>{symbol}</b>\n\nВведите количество:",
-        parse_mode='HTML'
+        parse_mode="HTML",
     )
     return ENTER_AMOUNT
+
 
 async def trade_enter_amount(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         amount = float(update.message.text.replace(",", "."))
         if amount <= 0:
             raise ValueError()
-        context.user_data['trade_amount'] = amount
+        context.user_data["trade_amount"] = amount
 
-        symbol = context.user_data['trade_symbol']
+        symbol = context.user_data["trade_symbol"]
         await update.message.reply_text("🔄 Получаю цену...")
 
         async with aiohttp.ClientSession() as session:
@@ -1768,26 +1736,28 @@ async def trade_enter_amount(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
         if crypto_data:
             current_price = crypto_data["usd"]
-            context.user_data['trade_price'] = current_price
+            context.user_data["trade_price"] = current_price
 
-            keyboard = [[InlineKeyboardButton(
-                f"➡️ Продолжить с ${current_price:,.4f}",
-                callback_data="price_continue"
-            )]]
-            reply_markup = InlineKeyboardMarkup(keyboard)
-
+            keyboard = [
+                [
+                    InlineKeyboardButton(
+                        f"➡️ Продолжить с ${current_price:,.4f}",
+                        callback_data="price_continue",
+                    )
+                ]
+            ]
             await update.message.reply_text(
                 f"✅ Количество: <b>{amount:.4f}</b>\n\n"
                 f"Цена: <b>${current_price:,.4f}</b>\n\n"
                 f"Нажмите кнопку или введите свою цену:",
-                parse_mode='HTML',
-                reply_markup=reply_markup
+                parse_mode="HTML",
+                reply_markup=InlineKeyboardMarkup(keyboard),
             )
         else:
             await update.message.reply_text(
                 f"✅ Количество: <b>{amount:.4f}</b>\n\n"
                 f"Введите цену покупки (USD):",
-                parse_mode='HTML'
+                parse_mode="HTML",
             )
 
         return ENTER_PRICE
@@ -1795,39 +1765,41 @@ async def trade_enter_amount(update: Update, context: ContextTypes.DEFAULT_TYPE)
         await update.message.reply_text("❌ Введите число")
         return ENTER_AMOUNT
 
+
 async def trade_enter_price(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # Вариант с callback-кнопкой "price_continue"
+    # Вариант через кнопку
     if update.callback_query:
         query = update.callback_query
         await query.answer()
 
         if query.data == "price_continue":
-            price = context.user_data.get('trade_price')
+            price = context.user_data.get("trade_price")
 
             await query.edit_message_text(
                 f"✅ Цена: <b>${price:,.4f}</b>\n\n"
                 f"Введите целевую прибыль (%):",
-                parse_mode='HTML'
+                parse_mode="HTML",
             )
             return ENTER_TARGET
 
-    # Вариант с ручным вводом цены
+    # Вариант ручного ввода
     try:
         price = float(update.message.text.replace(",", ""))
         if price <= 0:
             raise ValueError()
 
-        context.user_data['trade_price'] = price
+        context.user_data["trade_price"] = price
 
         await update.message.reply_text(
             f"✅ Цена: <b>${price:,.4f}</b>\n\n"
             f"Введите целевую прибыль (%):",
-            parse_mode='HTML'
+            parse_mode="HTML",
         )
         return ENTER_TARGET
     except Exception:
         await update.message.reply_text("❌ Введите число")
         return ENTER_PRICE
+
 
 async def trade_enter_target(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
@@ -1835,12 +1807,12 @@ async def trade_enter_target(update: Update, context: ContextTypes.DEFAULT_TYPE)
         if target <= 0:
             raise ValueError()
 
-        user_id = update.effective_user.id
-        symbol = context.user_data['trade_symbol']
-        amount = context.user_data['trade_amount']
-        price = context.user_data['trade_price']
+        uid = update.effective_user.id
+        symbol = context.user_data["trade_symbol"]
+        amount = context.user_data["trade_amount"]
+        price = context.user_data["trade_price"]
 
-        add_trade(user_id, symbol, amount, price, target)
+        add_trade(uid, symbol, amount, price, target)
 
         await update.message.reply_text(
             f"✅ <b>Сделка добавлена!</b>\n\n"
@@ -1848,8 +1820,8 @@ async def trade_enter_target(update: Update, context: ContextTypes.DEFAULT_TYPE)
             f"Количество: {amount:.4f}\n"
             f"Цена: ${price:,.2f}\n"
             f"Цель: +{target}%",
-            parse_mode='HTML',
-            reply_markup=get_main_menu()
+            parse_mode="HTML",
+            reply_markup=get_main_menu(),
         )
 
         context.user_data.clear()
@@ -1858,28 +1830,26 @@ async def trade_enter_target(update: Update, context: ContextTypes.DEFAULT_TYPE)
         await update.message.reply_text("❌ Введите число")
         return ENTER_TARGET
 
+
 async def trade_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("❌ Отменено", reply_markup=get_main_menu())
     context.user_data.clear()
     return ConversationHandler.END
 
-# ===================
-# === HELP / MISC ===
-# ===================
 
 async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "ℹ️ <b>Помощь - Fixed Bot v5</b>\n\n"
         "<b>✅ ИСПРАВЛЕНИЯ:</b>\n"
-        "• Защита от ошибок деления на ноль\n"
-        "• Валидация JSON данных\n"
+        "• Защита от деления на ноль\n"
+        "• Валидация JSON\n"
         "• Атомарная запись файлов\n"
         "• Безопасность API ключей\n\n"
         "<b>⚡ ОПТИМИЗАЦИИ:</b>\n"
         "• Только активные позиции\n"
-        "• Снижение запросов к внешним API\n"
-        "• Персистентное хранение (локально + Supabase)\n"
-        "• Binance API (приоритет)\n\n"
+        "• Меньше запросов вовне\n"
+        "• Персистентное хранение\n"
+        "• Binance приоритет\n\n"
         "<b>📊 ФУНКЦИИ:</b>\n"
         "• /add TICKER КОЛ-ВО\n"
         "• 💼 Мой портфель\n"
@@ -1887,14 +1857,14 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "• 📊 Рыночные сигналы\n"
         "• 👤 Мой профиль\n\n"
         "<b>🔔 Алерты:</b>\n"
-        "• Изменение цены > порога\n"
-        "• Достижение целевой прибыли",
-        parse_mode='HTML'
+        "• Большой скачок цены\n"
+        "• Достижение цели по прибыли",
+        parse_mode="HTML",
     )
+
 
 async def handle_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text
-
     if text == "💼 Мой портфель":
         await cmd_portfolio(update, context)
     elif text == "💹 Все цены":
@@ -1916,39 +1886,38 @@ async def handle_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif text == "ℹ️ Помощь":
         await cmd_help(update, context)
 
+
 async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE):
     print(f"❌ Error: {context.error}")
     traceback.print_exc()
 
-# ===============================
-# === HEALTH CHECK HTTP SERVER ==
-# ===============================
 
+# === HEALTH CHECK SERVER ===
 async def health_check(request):
-    """Health check endpoint для Render"""
     return web.Response(text="OK", status=200)
 
-async def start_health_server():
-    """Запустить HTTP сервер для health checks"""
-    app = web.Application()
-    app.router.add_get('/', health_check)
-    app.router.add_get('/health', health_check)
 
-    port = int(os.getenv('PORT', 10000))
+async def start_health_server():
+    """
+    Простой aiohttp сервер, чтобы Render видел "живой" сервис.
+    """
+    app = web.Application()
+    app.router.add_get("/", health_check)
+    app.router.add_get("/health", health_check)
+
+    port = int(os.getenv("PORT", 10000))
 
     runner = web.AppRunner(app)
     await runner.setup()
 
-    site = web.TCPSite(runner, '0.0.0.0', port)
+    site = web.TCPSite(runner, "0.0.0.0", port)
     await site.start()
 
     print(f"✅ Health check server running on port {port}")
     return runner
 
-# ===========
-# === MAIN ==
-# ===========
 
+# === MAIN ===
 def main():
     print("=" * 60)
     print("🚀 Starting FIXED Trading Bot v5")
@@ -1980,9 +1949,30 @@ def main():
     print(f"✅ DATA_DIR: {DATA_DIR}")
 
     print("🔧 Setting up signal handlers...")
-    import signal  # импорт тут же, чтобы не тянуть в глобальную область
+
+    import signal
+
+    # === PTB 20.x HOTFIX FOR PYTHON 3.13 ===
+    # Проблема: на Python 3.13 у python-telegram-bot 20.x крашится Application.builder()
+    # потому что Updater.__slots__ не содержит _Updater__polling_cleanup_cb.
+    # Мы добавляем этот слот вручную, чтобы не падать.
+    try:
+        from telegram.ext import _updater as _ptb_updater
+
+        if hasattr(_ptb_updater, "Updater"):
+            Upd = _ptb_updater.Updater
+            if hasattr(Upd, "__slots__"):
+                slots = list(Upd.__slots__)
+                if "_Updater__polling_cleanup_cb" not in slots:
+                    slots.append("_Updater__polling_cleanup_cb")
+                    Upd.__slots__ = tuple(slots)
+                    print("🐒 PTB hotfix applied: added _Updater__polling_cleanup_cb to Updater.__slots__")
+    except Exception as e:
+        print(f"⚠️ PTB hotfix failed (continuing anyway): {e}")
+    # === END HOTFIX ===
 
     print("🔧 Building Telegram Application...")
+
     try:
         app = Application.builder().token(TOKEN).build()
         print("✅ Application built successfully")
@@ -1992,30 +1982,41 @@ def main():
 
     print("🔧 Registering handlers...")
 
-    # Conversation handlers: Новая сделка
+    # Conversation handlers
     trade_conv = ConversationHandler(
-        entry_points=[MessageHandler(filters.Regex('^🆕 Новая сделка$'), cmd_new_trade)],
+        entry_points=[MessageHandler(filters.Regex("^🆕 Новая сделка$"), cmd_new_trade)],
         states={
-            SELECT_CRYPTO: [CallbackQueryHandler(trade_select_crypto, pattern='^trade_')],
-            ENTER_AMOUNT: [MessageHandler(filters.TEXT & ~filters.COMMAND, trade_enter_amount)],
-            ENTER_PRICE: [
-                CallbackQueryHandler(trade_enter_price, pattern='^price_'),
-                MessageHandler(filters.TEXT & ~filters.COMMAND, trade_enter_price)
+            SELECT_CRYPTO: [CallbackQueryHandler(trade_select_crypto, pattern="^trade_")],
+            ENTER_AMOUNT: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, trade_enter_amount)
             ],
-            ENTER_TARGET: [MessageHandler(filters.TEXT & ~filters.COMMAND, trade_enter_target)],
+            ENTER_PRICE: [
+                CallbackQueryHandler(trade_enter_price, pattern="^price_"),
+                MessageHandler(filters.TEXT & ~filters.COMMAND, trade_enter_price),
+            ],
+            ENTER_TARGET: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, trade_enter_target)
+            ],
         },
-        fallbacks=[CommandHandler('cancel', trade_cancel)],
+        fallbacks=[CommandHandler("cancel", trade_cancel)],
     )
 
-    # Conversation handlers: Добавление актива
     add_asset_conv = ConversationHandler(
-        entry_points=[MessageHandler(filters.Regex('^➕ Добавить актив$'), cmd_add_asset)],
+        entry_points=[
+            MessageHandler(filters.Regex("^➕ Добавить актив$"), cmd_add_asset)
+        ],
         states={
-            SELECT_ASSET_TYPE: [CallbackQueryHandler(add_asset_select_type, pattern='^asset_')],
-            SELECT_ASSET: [CallbackQueryHandler(add_asset_select_item, pattern='^add(ticker|crypto)_')],
-            ENTER_ASSET_AMOUNT: [MessageHandler(filters.TEXT & ~filters.COMMAND, add_asset_enter_amount)],
+            SELECT_ASSET_TYPE: [
+                CallbackQueryHandler(add_asset_select_type, pattern="^asset_")
+            ],
+            SELECT_ASSET: [
+                CallbackQueryHandler(add_asset_select_item, pattern="^add(ticker|crypto)_")
+            ],
+            ENTER_ASSET_AMOUNT: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, add_asset_enter_amount)
+            ],
         },
-        fallbacks=[CommandHandler('cancel', add_asset_cancel)],
+        fallbacks=[CommandHandler("cancel", add_asset_cancel)],
     )
 
     # Commands
@@ -2026,7 +2027,7 @@ def main():
     # Conversations
     app.add_handler(trade_conv)
     app.add_handler(add_asset_conv)
-    app.add_handler(CallbackQueryHandler(profile_select, pattern='^profile_'))
+    app.add_handler(CallbackQueryHandler(profile_select, pattern="^profile_"))
 
     # Buttons
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_buttons))
@@ -2036,7 +2037,7 @@ def main():
 
     print("✅ All handlers registered")
 
-    # Alerts job
+    # Init job queue for alerts
     job_queue = app.job_queue
     if job_queue and CHAT_ID:
         print("🔧 Setting up alerts job...")
@@ -2054,38 +2055,43 @@ def main():
     print("=" * 60)
 
     async def run_bot_with_health():
-        """Асинхронный раннер: Telegram bot + health server + graceful shutdown"""
+        """
+        Главный асинхронный раннер:
+        - health-check aiohttp сервер
+        - старт Telegram polling
+        - graceful shutdown по сигналам SIGINT/SIGTERM
+        """
+        # Перед стартом бота и health-сервера прогружаем данные из Supabase/локально
+        await async_init_from_supabase()
+
         health_runner = await start_health_server()
 
-        # локальный shutdown event
         shutdown_event = asyncio.Event()
 
         def signal_handler_inner(sig, frame):
-            """Обработчик сигналов для graceful shutdown"""
             print(f"\n⚠️  Received signal {sig}, initiating shutdown...")
             asyncio.get_event_loop().call_soon_threadsafe(shutdown_event.set)
 
-        # регистрируем обработчики сигналов
         signal.signal(signal.SIGINT, signal_handler_inner)
         signal.signal(signal.SIGTERM, signal_handler_inner)
 
         try:
             async with app:
                 await app.start()
+                # start_polling через updater (API PTB20)
                 await app.updater.start_polling(
                     drop_pending_updates=True,
-                    allowed_updates=Update.ALL_TYPES
+                    allowed_updates=Update.ALL_TYPES,
                 )
                 print("✅ Bot polling started successfully")
                 print("Press Ctrl+C to stop gracefully...")
 
-                # ждём сигнала на остановку
+                # ждём сигнала остановки
                 await shutdown_event.wait()
-
         finally:
             print("🛑 Stopping bot...")
 
-            # Останавливаем updater
+            # 1. Останавливаем updater
             try:
                 if app.updater and app.updater.running:
                     await app.updater.stop()
@@ -2093,7 +2099,7 @@ def main():
             except Exception as e:
                 print(f"  ⚠️ Error stopping updater: {e}")
 
-            # Останавливаем приложение
+            # 2. Останавливаем приложение
             try:
                 if app.running:
                     await app.stop()
@@ -2101,7 +2107,7 @@ def main():
             except Exception as e:
                 print(f"  ⚠️ Error stopping application: {e}")
 
-            # HTTP health server
+            # 3. Health server
             print("🛑 Stopping health server...")
             try:
                 await health_runner.cleanup()
@@ -2109,17 +2115,17 @@ def main():
             except Exception as e:
                 print(f"  ⚠️ Error stopping health server: {e}")
 
-            # финальное сохранение данных
+            # 4. Сохранить актуальные данные локально
             print("💾 Saving final state...")
             try:
                 price_cache.save()
-                save_portfolios()
-                save_trades()
+                save_portfolios_local()
+                save_trades_local()
                 print("  ✅ Data saved")
             except Exception as e:
                 print(f"  ⚠️ Error saving data: {e}")
 
-            # закрыть сессию Supabase
+            # 5. Закрыть Supabase сессию
             try:
                 await supabase_storage.close()
                 print("  ✅ Supabase session closed")
