@@ -11,11 +11,14 @@ import math
 import asyncio
 import traceback
 import aiohttp
+from aiohttp import web
 import json
+import sys
 from typing import Dict, Any, Optional, Tuple, List
 from datetime import time as dt_time, datetime, timedelta
 from pathlib import Path
 
+import telegram
 from telegram import Update, ReplyKeyboardMarkup, KeyboardButton, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     Application,
@@ -1417,9 +1420,35 @@ async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE):
     print(f"❌ Error: {context.error}")
     traceback.print_exc()
 
+# === HEALTH CHECK SERVER ДЛЯ RENDER ===
+async def health_check(request):
+    """Health check endpoint для Render"""
+    return web.Response(text="OK", status=200)
+
+async def start_health_server():
+    """Запустить HTTP сервер для health checks"""
+    app = web.Application()
+    app.router.add_get('/', health_check)
+    app.router.add_get('/health', health_check)
+    
+    port = int(os.getenv('PORT', 10000))
+    
+    runner = web.AppRunner(app)
+    await runner.setup()
+    
+    site = web.TCPSite(runner, '0.0.0.0', port)
+    await site.start()
+    
+    print(f"✅ Health check server running on port {port}")
+    return runner
+
+# === MAIN ===
 def main():
     print("=" * 60)
     print("🚀 Starting OPTIMIZED Trading Bot v5")
+    print("=" * 60)
+    print(f"Python version: {sys.version}")
+    print(f"Telegram bot version: {telegram.__version__}")
     print("=" * 60)
     print("Optimizations:")
     print("  ⚡ Only active assets checked")
@@ -1429,15 +1458,43 @@ def main():
     print("  📉 80% less API calls")
     print("=" * 60)
     
-    import sys
+    # Проверка обязательных переменных окружения
+    if not TOKEN:
+        print("❌ FATAL: BOT_TOKEN not set!")
+        sys.exit(1)
+    
+    print(f"✅ BOT_TOKEN: {TOKEN[:10]}...")
+    print(f"✅ CHAT_ID: {CHAT_ID if CHAT_ID else 'Not set (alerts disabled)'}")
+    print(f"✅ DATA_DIR: {DATA_DIR}")
+    
+    # Проверка директории данных
+    if not DATA_DIR.exists():
+        print(f"⚠️  DATA_DIR does not exist, creating...")
+        DATA_DIR.mkdir(parents=True, exist_ok=True)
+        print(f"✅ Created {DATA_DIR}")
+    else:
+        print(f"✅ DATA_DIR exists")
+    
+    # Python 3.10+ asyncio compatibility
+    print("🔧 Setting up asyncio event loop...")
     if sys.version_info >= (3, 10):
         try:
             loop = asyncio.get_running_loop()
+            print("✅ Using existing event loop")
         except RuntimeError:
             loop = asyncio.new_event_loop()
             asyncio.set_event_loop(loop)
+            print("✅ Created new event loop")
     
-    app = Application.builder().token(TOKEN).build()
+    print("🔧 Building Telegram Application...")
+    try:
+        app = Application.builder().token(TOKEN).build()
+        print("✅ Application built successfully")
+    except Exception as e:
+        print(f"❌ FATAL: Failed to build application: {e}")
+        sys.exit(1)
+    
+    print("🔧 Registering handlers...")
     
     # Conversation handlers
     trade_conv = ConversationHandler(
@@ -1480,19 +1537,66 @@ def main():
     # Errors
     app.add_error_handler(on_error)
     
+    print("✅ All handlers registered")
+    
     # ЕДИНАЯ фоновая задача для алертов
     job_queue = app.job_queue
     if job_queue and CHAT_ID:
+        print("🔧 Setting up alerts job...")
         job_queue.run_repeating(check_all_alerts, interval=600, first=60)
         print("✅ UNIFIED alerts (price + trade): ENABLED")
+        print("   First check in 60 seconds, then every 10 minutes")
     else:
-        print("⚠️  Alerts DISABLED (set CHAT_ID)")
+        if not CHAT_ID:
+            print("⚠️  Alerts DISABLED (CHAT_ID not set)")
+        else:
+            print("⚠️  Alerts DISABLED (job_queue not available)")
     
     print("=" * 60)
-    print("🔄 Starting bot...")
+    print("🔄 Starting bot polling...")
+    print("   Bot is now running and waiting for messages")
     print("=" * 60)
     
-    app.run_polling(drop_pending_updates=True)
+    # Запускаем health check сервер в отдельной задаче
+    async def run_bot_with_health():
+        """Запустить бота и health check сервер параллельно"""
+        # Запускаем health server
+        health_runner = await start_health_server()
+        
+        # Запускаем бота
+        try:
+            async with app:
+                await app.start()
+                await app.updater.start_polling(
+                    drop_pending_updates=True,
+                    allowed_updates=Update.ALL_TYPES
+                )
+                print("✅ Bot polling started successfully")
+                
+                # Держим бота активным
+                try:
+                    await asyncio.Event().wait()
+                except KeyboardInterrupt:
+                    print("\n⚠️  Received interrupt signal...")
+        finally:
+            print("🛑 Stopping bot...")
+            await app.updater.stop()
+            await app.stop()
+            await app.shutdown()
+            
+            print("🛑 Stopping health server...")
+            await health_runner.cleanup()
+            print("👋 Bot stopped")
+    
+    try:
+        # Запускаем всё в event loop
+        asyncio.run(run_bot_with_health())
+    except KeyboardInterrupt:
+        print("\n⚠️  Received interrupt signal, shutting down gracefully...")
+    except Exception as e:
+        print(f"\n❌ FATAL ERROR during polling: {e}")
+        traceback.print_exc()
+        sys.exit(1)
 
 if __name__ == "__main__":
     main()
