@@ -1777,18 +1777,42 @@ def main():
                 
         finally:
             print("🛑 Stopping bot...")
-            await app.updater.stop()
-            await app.stop()
-            await app.shutdown()
+            
+            # ИСПРАВЛЕНИЕ: Правильная последовательность остановки
+            try:
+                # Сначала останавливаем updater (прекращает получение обновлений)
+                if app.updater and app.updater.running:
+                    await app.updater.stop()
+                    print("  ✅ Updater stopped")
+            except Exception as e:
+                print(f"  ⚠️ Error stopping updater: {e}")
+            
+            try:
+                # Затем останавливаем приложение (но не shutdown!)
+                if app.running:
+                    await app.stop()
+                    print("  ✅ Application stopped")
+            except Exception as e:
+                print(f"  ⚠️ Error stopping application: {e}")
+            
+            # НЕ вызываем app.shutdown() - он вызывается автоматически через async with
             
             print("🛑 Stopping health server...")
-            await health_runner.cleanup()
+            try:
+                await health_runner.cleanup()
+                print("  ✅ Health server stopped")
+            except Exception as e:
+                print(f"  ⚠️ Error stopping health server: {e}")
             
             # Финальное сохранение данных
             print("💾 Saving final state...")
-            price_cache.save()
-            save_portfolios()
-            save_trades()
+            try:
+                price_cache.save()
+                save_portfolios()
+                save_trades()
+                print("  ✅ Data saved")
+            except Exception as e:
+                print(f"  ⚠️ Error saving data: {e}")
             
             print("👋 Bot stopped gracefully")
     
