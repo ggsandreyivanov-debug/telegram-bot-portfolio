@@ -1,2 +1,3 @@
-python-telegram-bot[job-queue]==21.8
+python-telegram-bot[job-queue]==21.9
 aiohttp[speedups]==3.10.5
+python-dotenv==1.0.1
