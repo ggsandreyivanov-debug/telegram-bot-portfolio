@@ -2493,6 +2493,8 @@ async def handle_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await cmd_portfolio(update, context)
     elif text == "💹 Все цены":
         await cmd_all_prices(update, context)
+         elif text == "🤖 AI-Советник":  # ← ДОБАВИТЬ ЭТУ СТРОКУ
+        await cmd_ask_ai(update, context)
     elif text == "🎯 Мои сделки":
         await cmd_my_trades(update, context)
     elif text == "📊 Рыночные сигналы":
@@ -2644,7 +2646,8 @@ def main():
     application.add_handler(CommandHandler("start", cmd_start))
     application.add_handler(CommandHandler("help", cmd_help))
     application.add_handler(CommandHandler("add", cmd_add))
-
+    application.add_handler(CommandHandler("ask", cmd_ask_ai))
+    
     # профиль
     application.add_handler(CallbackQueryHandler(profile_select, pattern="^profile_"))
 
