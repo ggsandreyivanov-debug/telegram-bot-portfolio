@@ -42,6 +42,18 @@ from telegram.ext import (
     filters,
 )
 
+from openai import AsyncOpenAI
+
+# После строки FINNHUB_API_KEY = os.getenv("FINNHUB_API_KEY")
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+
+if OPENAI_API_KEY:
+    print("✅ OPENAI_API_KEY: Set")
+    openai_client = AsyncOpenAI(api_key=OPENAI_API_KEY)
+else:
+    print("⚠ OPENAI_API_KEY not set - AI advisor будет недоступен")
+    openai_client = None
+    
 # =========================================================
 # ===============  ENV & GLOBAL CONFIG  ===================
 # =========================================================
@@ -1492,6 +1504,196 @@ def _bar_blue(percent: float, length: int = 10) -> str:
     filled = round((percent / 100.0) * length)
     return filled_char * filled + empty_char * (length - filled)
 
+
+# =========================================================
+# ==================  AI ADVISOR  =========================
+# =========================================================
+
+async def get_ai_advice(
+    user_id: int,
+    question: str,
+    portfolio: Dict[str, float],
+    market_data: Dict[str, Any],
+) -> str:
+    """
+    Получить AI-совет от GPT-4o-mini
+    """
+    if not openai_client:
+        return "⚠️ AI-советник недоступен (нет OPENAI_API_KEY)"
+
+    # Подготовить контекст
+    investor_type = user_profiles.get(user_id, "long")
+    inv_info = INVESTOR_TYPES[investor_type]
+    
+    # Собрать данные о портфеле
+    portfolio_summary = []
+    total_crypto = 0
+    total_stocks = 0
+    
+    for asset, qty in portfolio.items():
+        if qty > 0:
+            if asset in CRYPTO_IDS:
+                asset_type = "Крипта"
+                price = market_data.get(asset, {}).get("price", 0)
+                value = qty * price if price else 0
+                total_crypto += value
+            else:
+                asset_type = "Акции/ETF"
+                value = 0
+                total_stocks += 1
+            
+            portfolio_summary.append(f"- {asset}: {qty:.4f} ({asset_type})")
+    
+    portfolio_text = "\n".join(portfolio_summary) if portfolio_summary else "Пустой портфель"
+    
+    # Собрать рыночные данные
+    market_summary = []
+    for symbol, data in market_data.items():
+        if symbol == "fear_greed":
+            continue
+        price = data.get('price', 'N/A')
+        change = data.get('change_24h', 'N/A')
+        rsi = data.get('rsi', 'N/A')
+        trend = data.get('trend', 'N/A')
+        macd = "бычий ✅" if data.get('macd_bullish') else "медвежий ⚠️"
+        
+        market_summary.append(
+            f"{symbol}:\n"
+            f"  • Цена: ${price:,.2f}\n"
+            f"  • Изменение 24ч: {change:+.2f}%\n"
+            f"  • RSI: {rsi:.1f}\n"
+            f"  • Тренд: {trend}\n"
+            f"  • MACD: {macd}"
+        )
+    
+    market_text = "\n\n".join(market_summary)
+    
+    # Fear & Greed
+    fg_val = market_data.get("fear_greed", {}).get("value", "N/A")
+    if fg_val != "N/A":
+        if fg_val < 25:
+            fg_mood = "Экстремальный страх 😱"
+        elif fg_val < 45:
+            fg_mood = "Страх 😰"
+        elif fg_val < 55:
+            fg_mood = "Нейтрально 😐"
+        elif fg_val < 75:
+            fg_mood = "Жадность 😃"
+        else:
+            fg_mood = "Экстремальная жадность 🤑"
+    else:
+        fg_mood = "Нет данных"
+    
+    # Системный промпт
+    system_prompt = f"""Ты опытный финансовый советник и криптотрейдер с 10+ летним опытом.
+
+ПРОФИЛЬ КЛИЕНТА:
+- Тип: {inv_info['name']} ({inv_info['desc']})
+
+ПОРТФЕЛЬ:
+{portfolio_text}
+Крипта: ~${total_crypto:,.2f}
+
+РЫНОК:
+{market_text}
+
+Fear & Greed: {fg_val}/100 ({fg_mood})
+
+ЗАДАЧА: Дай конкретный совет с учётом профиля и рынка.
+
+ФОРМАТ (с эмодзи):
+📊 Анализ
+💡 Совет
+✅ План действий
+⚠️ Риски
+🎯 Таргеты
+
+Будь конкретным, давай цифры!"""
+
+    user_message = f"Вопрос: {question}"
+
+    try:
+        response = await openai_client.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_message}
+            ],
+            max_tokens=1500,
+            temperature=0.7,
+        )
+        
+        return response.choices[0].message.content
+        
+    except Exception as e:
+        print(f"❌ AI advisor error: {e}")
+        traceback.print_exc()
+        return f"⚠️ Ошибка: {str(e)}"
+
+
+async def cmd_ask_ai(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Спросить AI-советника"""
+    uid = update.effective_user.id
+    
+    if not context.args:
+        await update.message.reply_text(
+            "🤖 <b>AI-Советник</b>\n\n"
+            "Примеры:\n"
+            "• /ask Стоит ли покупать BTC?\n"
+            "• /ask Что делать с портфелем?\n"
+            "• /ask ETH или SOL?\n\n"
+            "<i>⚠️ Это не финсовет</i>",
+            parse_mode="HTML"
+        )
+        return
+    
+    question = " ".join(context.args)
+    
+    msg = await update.message.reply_text(
+        f"🤖 Анализирую...\n<i>\"{question}\"</i>",
+        parse_mode="HTML"
+    )
+    
+    portfolio = get_user_portfolio(uid)
+    market_data = {}
+    
+    try:
+        async with aiohttp.ClientSession() as session:
+            fg_val = await get_fear_greed_index(session)
+            
+            for symbol in ["BTC", "ETH", "SOL", "AVAX"]:
+                cdata = await get_crypto_price(session, symbol, use_cache=False)
+                ta_data = await calculate_technical_indicators(session, symbol)
+                
+                if cdata and ta_data:
+                    market_data[symbol] = {
+                        "price": cdata["usd"],
+                        "change_24h": cdata.get("change_24h"),
+                        "rsi": ta_data.get("rsi"),
+                        "trend": ta_data.get("trend"),
+                        "macd_bullish": ta_data.get("macd_bullish"),
+                    }
+                
+                await asyncio.sleep(0.2)
+            
+            market_data["fear_greed"] = {"value": fg_val}
+        
+        advice = await get_ai_advice(uid, question, portfolio, market_data)
+        
+        full_msg = f"🤖 <b>AI-Советник</b>\n\n{advice}\n\n━━━━━━━━━━━━━━━━━━━━━━━━━━━\n<i>⚠️ Не финсовет. DYOR!</i>"
+        
+        if len(full_msg) > 4000:
+            await msg.edit_text(f"🤖 <b>AI-Советник</b>\n\n{advice[:3500]}", parse_mode="HTML")
+            await update.message.reply_text(advice[3500:] + "\n\n━━━━━━━━━━━━━━━━━━━━━━━━━━━\n<i>⚠️ Не финсовет. DYOR!</i>", parse_mode="HTML")
+        else:
+            await msg.edit_text(full_msg, parse_mode="HTML")
+        
+    except Exception as e:
+        print(f"❌ ask_ai error: {e}")
+        traceback.print_exc()
+        await msg.edit_text(f"⚠️ Ошибка AI: {str(e)}", parse_mode="HTML")
+
+
 # =========================================================
 # ======================== HANDLERS =======================
 # =========================================================
@@ -1500,9 +1702,9 @@ def get_main_menu():
     keyboard = [
         [KeyboardButton("💼 Мой портфель"), KeyboardButton("💹 Все цены")],
         [KeyboardButton("🎯 Мои сделки"), KeyboardButton("📊 Рыночные сигналы")],
-        [KeyboardButton("📰 События недели"), KeyboardButton("➕ Добавить актив")],
-        [KeyboardButton("🆕 Новая сделка"), KeyboardButton("👤 Мой профиль")],
-        [KeyboardButton("ℹ️ Помощь")],
+        [KeyboardButton("🤖 AI-Советник"), KeyboardButton("📰 События недели")],  # ← ЭТУ СТРОКУ
+        [KeyboardButton("➕ Добавить актив"), KeyboardButton("🆕 Новая сделка")],
+        [KeyboardButton("👤 Мой профиль"), KeyboardButton("ℹ️ Помощь")],
     ]
     return ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
 
