@@ -2493,7 +2493,7 @@ async def handle_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await cmd_portfolio(update, context)
     elif text == "💹 Все цены":
         await cmd_all_prices(update, context)
-         elif text == "🤖 AI-Советник":  # ← ДОБАВИТЬ ЭТУ СТРОКУ
+    elif text == "🤖 AI-Советник": 
         await cmd_ask_ai(update, context)
     elif text == "🎯 Мои сделки":
         await cmd_my_trades(update, context)
